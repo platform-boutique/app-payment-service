@@ -59,12 +59,13 @@ Every error message is `<reason>: <human text>`; the reason is stable and machin
 
 | Failure | gRPC status | Reason prefix | Example message |
 |---|---|---|---|
-| Missing card, Luhn/length failure, unknown brand | `INVALID_ARGUMENT` | `invalid_card` | `invalid_card: Credit card info is invalid` |
+| Missing card, Luhn/length failure, unknown brand, expiration month outside 1-12 | `INVALID_ARGUMENT` | `invalid_card` | `invalid_card: Credit card info is invalid` |
 | Brand other than Visa/MasterCard | `INVALID_ARGUMENT` | `card_not_accepted` | `card_not_accepted: Sorry, we cannot process amex credit cards. Only VISA or MasterCard is accepted.` |
 | Expired card | `INVALID_ARGUMENT` | `expired_card` | `expired_card: Your credit card (ending 1111) expired on 1/2025` |
 | Declined | `FAILED_PRECONDITION` | `card_declined` | `card_declined: Your card (ending 0002) was declined by the issuer` |
 | Insufficient funds | `FAILED_PRECONDITION` | `insufficient_funds` | `insufficient_funds: Your card (ending 9995) has insufficient funds` |
 | Processor error (retry later) | `UNAVAILABLE` | `processing_error` | `processing_error: The payment processor could not complete the charge; please retry` |
+| Charge with a missing or negative amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: amount is required and must not be negative` |
 | Refund without `transaction_id`, negative refund amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: transaction_id is required` |
 | Anything unexpected | `INTERNAL` | `internal_error` | `internal_error: unexpected payment failure` (the real exception text is never returned) |
 

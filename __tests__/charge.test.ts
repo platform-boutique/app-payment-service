@@ -107,6 +107,25 @@ describe('charge() — happy paths', () => {
   });
 });
 
+describe('charge() — amount validation -> INVALID_ARGUMENT', () => {
+  it('rejects a missing amount', async () => {
+    const req = { ...makeRequest({}), amount: null };
+    const err = await failure(req);
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+
+  it.each([
+    ['negative units', { units: -50 }],
+    ['negative nanos', { nanos: -1 }],
+    ['nanos above 999999999', { nanos: 1_000_000_000 }],
+  ])('rejects %s', async (_name, overrides) => {
+    const err = await failure(makeRequest(overrides));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Validation failures -> INVALID_ARGUMENT
 // ---------------------------------------------------------------------------

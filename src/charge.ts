@@ -6,6 +6,7 @@ import {
   ExpiredCreditCard,
   InsufficientFunds,
   InvalidCreditCard,
+  InvalidRequest,
   ProcessingError,
   UnacceptedCreditCard,
 } from './errors';
@@ -148,6 +149,11 @@ export async function charge(
 
   if (currentYear * 12 + currentMonth > year * 12 + month) {
     throw new ExpiredCreditCard(last4, month, year);
+  }
+
+  // The amount must be present and not negative; a charge without an amount is not a charge.
+  if (!amount || Number(amount.units) < 0 || amount.nanos < 0 || amount.nanos > 999_999_999) {
+    throw new InvalidRequest('amount is required and must not be negative');
   }
 
   // Simulated issuer / processor outcomes for the documented test cards.
