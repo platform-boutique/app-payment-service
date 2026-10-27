@@ -3,7 +3,7 @@
 <div class="pd-hero" markdown>
 <span class="pd-kicker">service · platform-demo</span>
 
-A gRPC service that "processes" payments for the platform-demo e-commerce platform. It validates a credit card (number checksum, brand, expiry) and returns a random transaction ID. **No real payment provider is involved and nothing is persisted** — it is a simulation. It is stateless, has no downstream dependencies, and is called only by `checkout-service`.
+A gRPC service that "processes" payments for the platform-demo e-commerce platform. It validates a credit card (number checksum, brand, expiry), simulates declines and processor errors for documented test cards, returns a random transaction ID, and simulates refunds. **No real payment provider is involved and nothing is persisted** — it is a simulation. It is stateless, has no downstream dependencies, and is called only by `checkout-service`.
 </div>
 
 <div class="pd-facts" markdown>
@@ -35,7 +35,7 @@ flowchart LR
 | **Health** | `grpc.health.v1.Health/Check` on `50051` — static `SERVING` |
 | **State** | None |
 | **Depends on** | Nothing (optional: OTLP collector, Pyroscope) |
-| **Called by** | `checkout-service` (`Charge`) |
+| **Called by** | `checkout-service` (`Charge`; `Refund` is not called yet) |
 | **gRPC reflection** | Not enabled — pass `-proto` to `grpcurl` |
 
 ## Find it elsewhere
