@@ -2,7 +2,8 @@
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `50051` | gRPC listen port. **Must be set when relying on the Docker `HEALTHCHECK`** (see below) |
+| `PORT` | `50051` | gRPC listen port (the Docker `HEALTHCHECK` falls back to 50051 too) |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `5000` | On `SIGTERM`/`SIGINT`: how long to wait for in-flight calls before cancelling them (positive integer; anything else uses the default) |
 | `NODE_ENV` | `production` (set in image) | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for **traces, metrics and logs** (scheme required), e.g. `http://alloy.monitoring.svc.cluster.local:4317`. Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`). Telemetry is on **only if** one of them is set and non-empty |
 | `OTEL_SDK_DISABLED` | unset | `true` forces traces/metrics/logs export off even if an endpoint is set (standard OpenTelemetry switch) |

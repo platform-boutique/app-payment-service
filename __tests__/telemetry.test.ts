@@ -177,6 +177,18 @@ describe('telemetry module', () => {
     }
   });
 
+  it('does not install its own SIGTERM/SIGINT handlers (server.ts drains RPCs first)', () => {
+    const before = [process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')];
+    loadTelemetry({});
+    expect([process.listenerCount('SIGTERM'), process.listenerCount('SIGINT')]).toEqual(before);
+  });
+
+  it('flushTelemetry flushes once and never exits', async () => {
+    const { mod, nodeSdk } = loadTelemetry({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:9' });
+    await Promise.all([mod.flushTelemetry(), mod.flushTelemetry()]);
+    expect(nodeSdk.shutdown).toHaveBeenCalledTimes(1);
+  });
+
   it('OTEL_SDK_DISABLED=true keeps the SDK off despite an endpoint', () => {
     const { NodeSDK } = loadTelemetry({
       OTEL_EXPORTER_OTLP_ENDPOINT: 'http://127.0.0.1:9',

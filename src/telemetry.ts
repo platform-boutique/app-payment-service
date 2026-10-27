@@ -227,30 +227,35 @@ if (telemetryConfig.pyroscopeAddr) {
   Pyroscope.start();
 }
 
-/** Upper bound for flushing telemetry on shutdown (below the 5 s grace period). */
+/** Upper bound for flushing telemetry on shutdown. */
 export const SHUTDOWN_FLUSH_TIMEOUT_MS = 3000;
-let shuttingDown = false;
+let flushing: Promise<void> | null = null;
 
 /**
- * Flushes telemetry and the profiler (bounded by SHUTDOWN_FLUSH_TIMEOUT_MS),
- * then exits with code 0. Flush failures are ignored: they must not keep the
- * process alive.
+ * Flushes telemetry and the profiler, bounded by SHUTDOWN_FLUSH_TIMEOUT_MS.
+ * Idempotent (a second call returns the first call's promise) and never
+ * rejects: flush failures are ignored, they must not keep the process alive.
+ * Does not exit and does not install signal handlers: the process lifecycle
+ * (drain in-flight RPCs, health, exit) lives in lifecycle.ts / server.ts.
  */
-export async function shutdown(exit: (code: number) => void = process.exit): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  const flush = Promise.allSettled([
-    sdk ? sdk.shutdown() : Promise.resolve(),
-    telemetryConfig.pyroscopeAddr ? Promise.resolve(Pyroscope.stop()) : Promise.resolve(),
-  ]);
-  await Promise.race([
-    flush,
-    new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS).unref()),
-  ]);
-  exit(0);
+export function flushTelemetry(): Promise<void> {
+  flushing ??= (async () => {
+    const flush = Promise.allSettled([
+      sdk ? sdk.shutdown() : Promise.resolve(),
+      telemetryConfig.pyroscopeAddr ? Promise.resolve(Pyroscope.stop()) : Promise.resolve(),
+    ]);
+    await Promise.race([
+      flush,
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS).unref()),
+    ]);
+  })();
+  return flushing;
 }
 
-process.once('SIGTERM', () => void shutdown());
-process.once('SIGINT', () => void shutdown());
+/** Flushes telemetry, then exits with code 0 (used when there is no server to drain). */
+export async function shutdown(exit: (code: number) => void = process.exit): Promise<void> {
+  await flushTelemetry();
+  exit(0);
+}
 
 export { sdk };

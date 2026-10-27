@@ -83,7 +83,8 @@ No log line, error message or span attribute contains a full card number or the 
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `50051` | gRPC listen port. **Must be set when relying on the Docker `HEALTHCHECK`** (see below) |
+| `PORT` | `50051` | gRPC listen port (the Docker `HEALTHCHECK` falls back to 50051 too) |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `5000` | On `SIGTERM`/`SIGINT`: how long to wait for in-flight calls before cancelling them (positive integer; anything else uses the default) |
 | `NODE_ENV` | `production` (set in image) | |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for **traces, metrics and logs** (scheme required), e.g. `http://alloy.monitoring.svc.cluster.local:4317`. Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`). Telemetry is on **only if** one of them is set and non-empty |
 | `OTEL_SDK_DISABLED` | unset | `true` forces traces/metrics/logs export off even if an endpoint is set (standard OpenTelemetry switch) |
@@ -113,7 +114,7 @@ Multi-stage [`Dockerfile`](Dockerfile):
 - **Entrypoint:** `node dist/server.js` (working dir `/app`).
 - **User:** `appuser` — UID `100`, GID `101` (verified). Set `runAsUser: 100` for `runAsNonRoot`.
 - **EXPOSE:** `50051` only.
-- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It reads `process.env.PORT` with no default, so it **fails if `PORT` is unset**. Kubernetes ignores it, but set `PORT` explicitly.
+- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It uses `process.env.PORT || 50051`, the same default as the server (fixed in 719ce3d; the probe command was run against the server, the image itself was not rebuilt). Kubernetes ignores it.
 - **Image size:** ~73 MB.
 
 ## Kubernetes deployment notes
@@ -143,7 +144,7 @@ livenessProbe:
 
 (The Node health handler implements `Check` only; `grpc:` probes only call `Check`.)
 
-**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the service flushes OpenTelemetry/Pyroscope (at most 3 s), then exits with code 0. In-flight RPCs are not drained first. `terminationGracePeriodSeconds: 5` is enough.
+**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the health service switches to `NOT_SERVING`, the server stops accepting calls and waits for in-flight RPCs (a `Charge` in progress is answered, not cut off) for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5000; calls still running after that are cancelled), then OpenTelemetry/Pyroscope are flushed (at most 3 s) and the process exits with code 0. Worst case 8 s with the defaults, so set `terminationGracePeriodSeconds: 10` (the old value 5 can cut a slow charge). Verified with a built `dist/server.js`: a `Charge` with the 3 s processing-error card, `SIGTERM` after 0.5 s: the call was answered with `processing_error` at ~2.5 s, exit code 0; a new connection during the drain is refused, so a readiness probe fails. A second signal is not intercepted and kills the process at once.
 
 **Security context**
 
@@ -232,13 +233,14 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ```
 ├── src/
-│   ├── server.ts        # gRPC bootstrap, Check handler, wires handlers.ts
+│   ├── server.ts        # gRPC bootstrap, wires handlers.ts and the shutdown
+│   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
 │   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
 │   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
 │   ├── refund.ts        # simulated, idempotent refund
 │   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
 │   ├── logger.ts        # pino factory with card-field redaction
-│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, SIGTERM shutdown
+│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
 │   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
 ├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off
@@ -255,4 +257,4 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 - Outcomes are keyed only on the documented test card numbers; there are no amount-based or random declines.
 - The processing-error card blocks its call for ~3 s (a timer, not CPU); callers with a deadline below 3 s see `DEADLINE_EXCEEDED` instead of `UNAVAILABLE`.
 - `checkout-service` does not call `Refund` yet and maps every payment error to `INTERNAL` (with the reason inside the message).
-- `SIGTERM` exits after the telemetry flush without draining in-flight RPCs; the Docker `HEALTHCHECK` depends on `PORT` being set.
+- On `SIGTERM` in-flight RPCs are drained for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5 s); a call that outlasts it is cancelled. The `Check` health handler answers `NOT_SERVING` during the drain, but `Watch` is not implemented.

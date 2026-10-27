@@ -1,9 +1,10 @@
-import { startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
+import { flushTelemetry, startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { createLogger } from './logger';
 import { makeHandlers } from './handlers';
+import { createHealth, createShutdown, drainTimeoutFromEnv } from './lifecycle';
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -38,12 +39,7 @@ const healthProto = (loadProto(HEALTH_PROTO_PATH) as any).grpc.health.v1;
 
 const handlers = makeHandlers({ logger, startRpcMetrics });
 
-function check(
-  _call: grpc.ServerUnaryCall<unknown, unknown>,
-  callback: grpc.sendUnaryData<{ status: string }>,
-): void {
-  callback(null, { status: 'SERVING' });
-}
+const health = createHealth();
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -54,7 +50,7 @@ function main(): void {
 
   const server = new grpc.Server();
   server.addService(paymentProto.PaymentService.service, handlers);
-  server.addService(healthProto.Health.service, { check });
+  server.addService(healthProto.Health.service, { check: health.check });
 
   server.bindAsync(`[::]:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {
@@ -70,6 +66,19 @@ function main(): void {
       'PaymentService gRPC server started',
     );
   });
+
+  // SIGTERM/SIGINT: health -> NOT_SERVING, wait for in-flight calls (tryShutdown, bounded),
+  // flush telemetry, exit 0. A second signal is not intercepted and kills the process.
+  const shutdown = createShutdown({
+    server,
+    health,
+    flushTelemetry,
+    exit: process.exit,
+    logger,
+    drainTimeoutMs: drainTimeoutFromEnv(),
+  });
+  process.once('SIGTERM', () => void shutdown());
+  process.once('SIGINT', () => void shutdown());
 }
 
 main();

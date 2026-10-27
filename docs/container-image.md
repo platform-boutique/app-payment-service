@@ -10,5 +10,5 @@ Multi-stage [`Dockerfile`](https://github.com/platform-boutique/app-payment-serv
 - **Entrypoint:** `node dist/server.js` (working dir `/app`).
 - **User:** `appuser` — UID `100`, GID `101` (verified). Set `runAsUser: 100` for `runAsNonRoot`.
 - **EXPOSE:** `50051` only.
-- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It reads `process.env.PORT` with no default, so it **fails if `PORT` is unset**. Kubernetes ignores it, but set `PORT` explicitly.
+- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It uses `process.env.PORT || 50051`, the same default as the server (fixed in 719ce3d; the probe command was run against the server, the image itself was not rebuilt). Kubernetes ignores it.
 - **Image size:** ~73 MB.

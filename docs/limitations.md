@@ -4,4 +4,4 @@
 - Outcomes are keyed only on the documented test card numbers; there are no amount-based or random declines.
 - The processing-error card blocks its call for ~3 s (a timer, not CPU); callers with a deadline below 3 s see `DEADLINE_EXCEEDED` instead of `UNAVAILABLE`.
 - `checkout-service` does not call `Refund` yet and maps every payment error to `INTERNAL` (with the reason inside the message).
-- `SIGTERM` exits after the telemetry flush without draining in-flight RPCs; the Docker `HEALTHCHECK` depends on `PORT` being set.
+- On `SIGTERM` in-flight RPCs are drained for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5 s); a call that outlasts it is cancelled. The `Check` health handler answers `NOT_SERVING` during the drain, but `Watch` is not implemented.

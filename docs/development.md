@@ -42,13 +42,14 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ```
 ├── src/
-│   ├── server.ts        # gRPC bootstrap, Check handler, wires handlers.ts
+│   ├── server.ts        # gRPC bootstrap, wires handlers.ts and the shutdown
+│   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
 │   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
 │   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
 │   ├── refund.ts        # simulated, idempotent refund
 │   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
 │   ├── logger.ts        # pino factory with card-field redaction
-│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, SIGTERM shutdown
+│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
 │   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
 ├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off

@@ -25,7 +25,7 @@ livenessProbe:
 
 (The Node health handler implements `Check` only; `grpc:` probes only call `Check`.)
 
-**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the service flushes OpenTelemetry/Pyroscope (at most 3 s), then exits with code 0. In-flight RPCs are not drained first. `terminationGracePeriodSeconds: 5` is enough.
+**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the health service switches to `NOT_SERVING`, the server stops accepting calls and waits for in-flight RPCs (a `Charge` in progress is answered, not cut off) for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5000; calls still running after that are cancelled), then OpenTelemetry/Pyroscope are flushed (at most 3 s) and the process exits with code 0. Worst case 8 s with the defaults, so set `terminationGracePeriodSeconds: 10` (the old value 5 can cut a slow charge). Verified with a built `dist/server.js`: a `Charge` with the 3 s processing-error card, `SIGTERM` after 0.5 s: the call was answered with `processing_error` at ~2.5 s, exit code 0; a new connection during the drain is refused, so a readiness probe fails. A second signal is not intercepted and kills the process at once.
 
 **Security context**
 
