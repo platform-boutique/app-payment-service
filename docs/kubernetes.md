@@ -25,7 +25,7 @@ livenessProbe:
 
 (The Node health handler implements `Check` only; `grpc:` probes only call `Check`.)
 
-**Graceful shutdown:** a `SIGTERM` handler flushes OpenTelemetry/Pyroscope but never exits the process, so Node runs until `SIGKILL`. Set `terminationGracePeriodSeconds: 5`.
+**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the service flushes OpenTelemetry/Pyroscope (at most 3 s), then exits with code 0. In-flight RPCs are not drained first. `terminationGracePeriodSeconds: 5` is enough.
 
 **Security context**
 

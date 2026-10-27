@@ -48,9 +48,10 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 │   ├── refund.ts        # simulated, idempotent refund
 │   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
 │   ├── logger.ts        # pino factory with card-field redaction
-│   ├── telemetry.ts     # OTel SDK, Prometheus exporter, RPC metrics, runtime gauges, Pyroscope
+│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, SIGTERM shutdown
+│   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
-├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture)
+├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off
 ├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile
