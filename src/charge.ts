@@ -141,6 +141,11 @@ export async function charge(
   const currentYear = now.getFullYear();
   const { credit_card_expiration_year: year, credit_card_expiration_month: month } = creditCard;
 
+  // A month outside 1-12 (e.g. 99) would otherwise compare as "far in the future" and pass the expiry check.
+  if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+    throw new InvalidCreditCard();
+  }
+
   if (currentYear * 12 + currentMonth > year * 12 + month) {
     throw new ExpiredCreditCard(last4, month, year);
   }

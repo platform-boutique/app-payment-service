@@ -157,6 +157,15 @@ describe('charge() — expired card -> INVALID_ARGUMENT', () => {
     expect(err.reason).toBe('expired_card');
   });
 
+  it.each([[0], [13], [99], [-1], [1.5]])(
+    'rejects expiration month %s as invalid_card (not accepted as "far in the future")',
+    async (expirationMonth) => {
+      const err = await failure(makeRequest({ expirationYear: futureYear, expirationMonth }));
+      expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+      expect(err.reason).toBe('invalid_card');
+    },
+  );
+
   it('message has the last four digits and the expiry, never the full number', async () => {
     const err = await failure(makeRequest({ expirationYear: pastYear, expirationMonth: 6 }));
     expect(err.message).toContain('ending 1111');
