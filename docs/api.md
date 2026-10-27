@@ -15,10 +15,10 @@ Checks, in this order (the first failure wins):
 
 1. A card must be present and the number must pass `simple-card-validator` (Luhn + known brand; spaces and dashes are allowed).
 2. Brand must be **Visa or MasterCard**.
-3. Expiry month/year must not be in the past (a card expiring this month passes).
-4. The documented test cards below then produce their simulated outcome; every other valid card succeeds.
-
-The CVV and `amount` are **not** validated.
+3. CVV must be an integer 0-9999 (`credit_card_cvv` is an `int32`, so leading zeros are already lost: `012` arrives as 12, and a missing CVV arrives as 0; the check therefore rejects only values that cannot be a 3-4 digit CVV). The CVV is never logged or echoed in an error. Otherwise it is not verified.
+4. Expiry month/year must not be in the past (a card expiring this month passes).
+5. `amount` must be present, `units` an integer that is not negative, `nanos` an integer 0-999999999.
+6. The documented test cards below then produce their simulated outcome; every other valid card succeeds.
 
 ### Test cards
 
@@ -39,21 +39,21 @@ Every error message is `<reason>: <human text>`; the reason is stable and machin
 
 | Failure | gRPC status | Reason prefix | Example message |
 |---|---|---|---|
-| Missing card, Luhn/length failure, unknown brand, expiration month outside 1-12 | `INVALID_ARGUMENT` | `invalid_card` | `invalid_card: Credit card info is invalid` |
+| Missing card, Luhn/length failure, unknown brand, expiration month outside 1-12, CVV outside 0-9999 | `INVALID_ARGUMENT` | `invalid_card` | `invalid_card: Credit card info is invalid` (CVV: `invalid_card: Credit card info is invalid: CVV must be 3 or 4 digits`) |
 | Brand other than Visa/MasterCard | `INVALID_ARGUMENT` | `card_not_accepted` | `card_not_accepted: Sorry, we cannot process amex credit cards. Only VISA or MasterCard is accepted.` |
 | Expired card | `INVALID_ARGUMENT` | `expired_card` | `expired_card: Your credit card (ending 1111) expired on 1/2025` |
 | Declined | `FAILED_PRECONDITION` | `card_declined` | `card_declined: Your card (ending 0002) was declined by the issuer` |
 | Insufficient funds | `FAILED_PRECONDITION` | `insufficient_funds` | `insufficient_funds: Your card (ending 9995) has insufficient funds` |
 | Processor error (retry later) | `UNAVAILABLE` | `processing_error` | `processing_error: The payment processor could not complete the charge; please retry` |
-| Charge with a missing or negative amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: amount is required and must not be negative` |
-| Refund without `transaction_id`, negative refund amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: transaction_id is required` |
+| Charge with a missing, negative or malformed amount (non-integer units, nanos outside 0-999999999) | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: amount is required` / `amount must not be negative` / `amount.nanos must be an integer between 0 and 999999999` |
+| Refund without `transaction_id`, negative or malformed refund amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: transaction_id is required` |
 | Anything unexpected | `INTERNAL` | `internal_error` | `internal_error: unexpected payment failure` (the real exception text is never returned) |
 
 `checkout-service` currently wraps every payment error as `INTERNAL "failed to charge card: ..."`, so the code is lost there but the reason prefix survives inside the message.
 
 ### Refund
 
-Simulated: nothing is stored and the transaction is **not looked up** (the service keeps no state), so any non-empty `transaction_id` is accepted. Blank (or whitespace-only) → `INVALID_ARGUMENT`; a negative `amount` → `INVALID_ARGUMENT`; `amount` is otherwise not checked against the charge. `refund_id` is a UUID v5 of the trimmed transaction id, so **the same transaction id always returns the same refund id** (safe to retry), whatever the amount.
+Simulated: nothing is stored and the transaction is **not looked up** (the service keeps no state), so any non-empty `transaction_id` is accepted. Blank (or whitespace-only) → `INVALID_ARGUMENT`; a negative or malformed `amount` (units not an integer, nanos not an integer in 0-999999999) → `INVALID_ARGUMENT` (the same check as `Charge`); `amount` is otherwise not checked against the charge. `refund_id` is a UUID v5 of the trimmed transaction id, so **the same transaction id always returns the same refund id** (safe to retry), whatever the amount.
 
 ### Card data in logs and traces
 

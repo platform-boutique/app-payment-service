@@ -1,6 +1,6 @@
 import { v5 as uuidv5 } from 'uuid';
 import { InvalidRequest } from './errors';
-import type { Money } from './charge';
+import { assertValidMoney, type Money } from './money';
 
 export interface RefundRequest {
   transaction_id: string;
@@ -27,8 +27,8 @@ export function refund(request: RefundRequest): RefundResponse {
     throw new InvalidRequest('transaction_id is required');
   }
   const amount = request.amount;
-  if (amount && (Number(amount.units) < 0 || amount.nanos < 0)) {
-    throw new InvalidRequest('amount must not be negative');
+  if (amount) {
+    assertValidMoney(amount, 'amount');
   }
   return { refund_id: uuidv5(transactionId, REFUND_NAMESPACE) };
 }

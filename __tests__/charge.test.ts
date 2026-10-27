@@ -38,6 +38,7 @@ function makeRequest(overrides: {
   currencyCode?: string;
   units?: number;
   nanos?: number;
+  cvv?: number;
 }) {
   return {
     amount: {
@@ -47,7 +48,7 @@ function makeRequest(overrides: {
     },
     credit_card: {
       credit_card_number: overrides.cardNumber ?? VALID_VISA,
-      credit_card_cvv: 123,
+      credit_card_cvv: overrides.cvv ?? 123,
       credit_card_expiration_year: overrides.expirationYear ?? futureYear,
       credit_card_expiration_month: overrides.expirationMonth ?? 1,
     },
@@ -123,6 +124,68 @@ describe('charge() — amount validation -> INVALID_ARGUMENT', () => {
     const err = await failure(makeRequest(overrides));
     expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
     expect(err.reason).toBe('invalid_request');
+  });
+});
+
+describe('charge() — amount units/nanos must be integers', () => {
+  it.each([
+    ['non-numeric units', { units: 'abc' }],
+    ['fractional units', { units: 1.5 }],
+    ['NaN units', { units: NaN }],
+    ['units with a sign suffix', { units: '12-' }],
+    ['fractional nanos', { nanos: 0.5 }],
+    ['NaN nanos', { nanos: NaN }],
+  ])('rejects %s', async (_name, amountOverride) => {
+    const req = makeRequest({});
+    Object.assign(req.amount, amountOverride);
+    const err = await failure(req);
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+
+  it('accepts units as the decimal string proto-loader yields', async () => {
+    const req = makeRequest({});
+    Object.assign(req.amount, { units: '42' });
+    await expect(charge(req, deps)).resolves.toHaveProperty('transaction_id');
+  });
+});
+
+describe('charge() — CVV format -> INVALID_ARGUMENT, never echoed', () => {
+  it.each([[0], [12], [123], [999], [1234], [9999]])('accepts cvv %i', async (cvv) => {
+    await expect(charge(makeRequest({ cvv }), deps)).resolves.toHaveProperty('transaction_id');
+  });
+
+  it.each([
+    ['five digits', 12345],
+    ['negative', -123],
+    ['fractional', 12.5],
+    ['NaN', NaN],
+    ['huge', 2_000_000_000],
+  ])('rejects a cvv that is %s', async (_name, cvv) => {
+    const err = await failure(makeRequest({ cvv }));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_card');
+    expect(err.message).toBe(
+      'invalid_card: Credit card info is invalid: CVV must be 3 or 4 digits',
+    );
+    expect(err.message).not.toContain(String(cvv));
+  });
+
+  it('a missing cvv (undefined) is rejected', async () => {
+    const req = makeRequest({});
+    delete (req.credit_card as { credit_card_cvv?: number }).credit_card_cvv;
+    const err = await failure(req);
+    expect(err.reason).toBe('invalid_card');
+  });
+
+  it('does not log the cvv, also when it is rejected', async () => {
+    const lines: string[] = [];
+    const logger = createLogger('test', { write: (l: string) => void lines.push(l) });
+    await charge(makeRequest({ cvv: 4242 }), { ...deps, logger });
+    await expect(charge(makeRequest({ cvv: 777777 }), { ...deps, logger })).rejects.toBeDefined();
+    const all = lines.join('');
+    expect(all).not.toContain('4242');
+    expect(all).not.toContain('777777');
   });
 });
 

@@ -56,4 +56,28 @@ describe('refund()', () => {
     expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
     expect(err.message).toMatch(/negative/);
   });
+
+  it.each([
+    ['nanos above 999999999', { nanos: 1_000_000_000 }],
+    ['negative nanos', { nanos: -1 }],
+    ['fractional nanos', { nanos: 1.5 }],
+    ['NaN nanos', { nanos: NaN }],
+    ['non-numeric units', { units: 'abc' }],
+    ['fractional units', { units: '1.5' }],
+    ['NaN units', { units: NaN }],
+    ['empty units', { units: '' }],
+  ])('rejects %s', (_name, override) => {
+    const err = failure({ transaction_id: 'tx-1', amount: { ...amount, ...override } });
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+
+  it('accepts the largest valid nanos and units as a string', () => {
+    expect(
+      refund({
+        transaction_id: 'tx-1',
+        amount: { currency_code: 'USD', units: '5', nanos: 999_999_999 },
+      }).refund_id,
+    ).toMatch(UUID);
+  });
 });

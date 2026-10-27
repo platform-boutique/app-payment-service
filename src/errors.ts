@@ -28,8 +28,12 @@ export class PaymentError extends Error {
 }
 
 export class InvalidCreditCard extends PaymentError {
-  constructor() {
-    super(status.INVALID_ARGUMENT, 'invalid_card', 'Credit card info is invalid');
+  constructor(detail?: string) {
+    super(
+      status.INVALID_ARGUMENT,
+      'invalid_card',
+      detail ? `Credit card info is invalid: ${detail}` : 'Credit card info is invalid',
+    );
   }
 }
 

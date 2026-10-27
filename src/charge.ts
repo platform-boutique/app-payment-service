@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import cardValidator from 'simple-card-validator';
 import { createLogger, type Logger } from './logger';
+import { assertValidMoney, type Money } from './money';
 import {
   CardDeclined,
   ExpiredCreditCard,
@@ -25,11 +26,7 @@ export {
 // Types
 // ---------------------------------------------------------------------------
 
-export interface Money {
-  currency_code: string;
-  units: number | string; // proto-loader is configured with longs: String
-  nanos: number;
-}
+export type { Money };
 
 export interface CreditCardInfo {
   credit_card_number: string;
@@ -134,6 +131,13 @@ export async function charge(
     throw new UnacceptedCreditCard(cardType);
   }
 
+  // CVV: an int32 on the wire, so leading zeros are already lost ("012" arrives as 12): the
+  // check is an integer 0-9999, i.e. at most 4 digits. The value is never logged or echoed.
+  const cvv = creditCard.credit_card_cvv;
+  if (!Number.isInteger(cvv) || cvv < 0 || cvv > 9999) {
+    throw new InvalidCreditCard('CVV must be 3 or 4 digits');
+  }
+
   const last4 = lastFour(cardNumber);
 
   // Validate expiration is >= this month
@@ -151,10 +155,11 @@ export async function charge(
     throw new ExpiredCreditCard(last4, month, year);
   }
 
-  // The amount must be present and not negative; a charge without an amount is not a charge.
-  if (!amount || Number(amount.units) < 0 || amount.nanos < 0 || amount.nanos > 999_999_999) {
-    throw new InvalidRequest('amount is required and must not be negative');
+  // The amount must be present and valid; a charge without an amount is not a charge.
+  if (!amount) {
+    throw new InvalidRequest('amount is required');
   }
+  assertValidMoney(amount, 'amount');
 
   // Simulated issuer / processor outcomes for the documented test cards.
   switch (digitsOnly(cardNumber)) {
