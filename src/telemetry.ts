@@ -14,50 +14,52 @@ import { hostname } from 'os';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import Pyroscope from '@pyroscope/nodejs';
 
-const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'payment-service';
-const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '1.0.0';
-// OTLP/gRPC endpoint (scheme required, e.g. http://alloy:4317). COLLECTOR_SERVICE_ADDR (host:port)
-// is kept as a legacy fallback.
-const OTEL_ENDPOINT =
-  process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??
-  (process.env.COLLECTOR_SERVICE_ADDR
-    ? `http://${process.env.COLLECTOR_SERVICE_ADDR}`
-    : 'http://localhost:4317');
-const PYROSCOPE_ENDPOINT = process.env.PYROSCOPE_ADDR ?? 'http://localhost:4040';
-const METRIC_EXPORT_INTERVAL_MS = parseInt(process.env.OTEL_METRIC_EXPORT_INTERVAL ?? '15000', 10);
+import { resolveTelemetryConfig } from './telemetry-config';
 
-const resource = resourceFromAttributes({
-  [ATTR_SERVICE_NAME]: SERVICE_NAME,
-  [ATTR_SERVICE_VERSION]: SERVICE_VERSION,
-  // Distinguishes replicas: in Kubernetes the hostname is the pod name.
-  'service.instance.id': process.env.HOSTNAME ?? hostname(),
-});
+// Telemetry contract: see telemetry-config.ts. With nothing set, no SDK and no
+// profiler start, so the service makes no outbound connections.
+export const telemetryConfig = resolveTelemetryConfig(process.env);
+const SERVICE_NAME = telemetryConfig.serviceName;
+const SERVICE_VERSION = telemetryConfig.serviceVersion;
 
-// All three signals are pushed over OTLP/gRPC to the collector (Alloy), which fans out
-// to Tempo (traces), Mimir (metrics) and Loki (logs).
-const sdk = new NodeSDK({
-  resource,
-  spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter({ url: OTEL_ENDPOINT }))],
-  metricReaders: [
-    new PeriodicExportingMetricReader({
-      exporter: new OTLPMetricExporter({ url: OTEL_ENDPOINT }),
-      exportIntervalMillis: METRIC_EXPORT_INTERVAL_MS,
-    }),
-  ],
-  logRecordProcessors: [
-    new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: OTEL_ENDPOINT }) }),
-  ],
-  // PinoInstrumentation forwards pino records to the OTel logs pipeline and adds trace/span ids.
-  instrumentations: [new GrpcInstrumentation(), new PinoInstrumentation()],
-});
+function startSdk(endpoint: string): NodeSDK {
+  const resource = resourceFromAttributes({
+    [ATTR_SERVICE_NAME]: SERVICE_NAME,
+    [ATTR_SERVICE_VERSION]: SERVICE_VERSION,
+    // Distinguishes replicas: in Kubernetes the hostname is the pod name.
+    'service.instance.id': process.env.HOSTNAME ?? hostname(),
+  });
 
-// Start the SDK immediately on import — server.ts does `import './telemetry'`
-// so this runs before any gRPC server/client or pino code loads, ensuring instrumentation
-// patches @grpc/grpc-js and pino before they are used.
-sdk.start();
+  // All three signals are pushed over OTLP/gRPC to the collector (Alloy), which fans out
+  // to Tempo (traces), Mimir (metrics) and Loki (logs).
+  const nodeSdk = new NodeSDK({
+    resource,
+    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter({ url: endpoint }))],
+    metricReaders: [
+      new PeriodicExportingMetricReader({
+        exporter: new OTLPMetricExporter({ url: endpoint }),
+        exportIntervalMillis: telemetryConfig.metricExportIntervalMs,
+      }),
+    ],
+    logRecordProcessors: [
+      new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: endpoint }) }),
+    ],
+    // PinoInstrumentation forwards pino records to the OTel logs pipeline and adds trace/span ids.
+    instrumentations: [new GrpcInstrumentation(), new PinoInstrumentation()],
+  });
+  // Started immediately on import — server.ts imports this module first, so the
+  // instrumentation patches @grpc/grpc-js and pino before they are loaded.
+  nodeSdk.start();
+  return nodeSdk;
+}
+
+const sdk: NodeSDK | null = telemetryConfig.otlpEndpoint
+  ? startSdk(telemetryConfig.otlpEndpoint)
+  : null;
 
 // ---------------------------------------------------------------------------
 // Custom gRPC server metrics
+// (With telemetry off the global meter is the OTel no-op meter, so these cost nothing.)
 // The Node.js GrpcInstrumentation only produces traces, not metrics.
 // We create manual instruments that match the OTel RPC semantic conventions
 // so the Grafana dashboard can query them.
@@ -215,17 +217,40 @@ export function startRpcMetrics(method: string): (grpcStatusCode: number) => voi
   };
 }
 
-// --- Pyroscope continuous profiling ---
-Pyroscope.init({
-  serverAddress: PYROSCOPE_ENDPOINT,
-  appName: SERVICE_NAME,
-  tags: { version: SERVICE_VERSION },
-});
-Pyroscope.start();
+// --- Pyroscope continuous profiling (only when configured) ---
+if (telemetryConfig.pyroscopeAddr) {
+  Pyroscope.init({
+    serverAddress: telemetryConfig.pyroscopeAddr,
+    appName: SERVICE_NAME,
+    tags: { version: SERVICE_VERSION },
+  });
+  Pyroscope.start();
+}
 
-process.on('SIGTERM', async () => {
-  await sdk.shutdown();
-  Pyroscope.stop();
-});
+/** Upper bound for flushing telemetry on shutdown (below the 5 s grace period). */
+export const SHUTDOWN_FLUSH_TIMEOUT_MS = 3000;
+let shuttingDown = false;
+
+/**
+ * Flushes telemetry and the profiler (bounded by SHUTDOWN_FLUSH_TIMEOUT_MS),
+ * then exits with code 0. Flush failures are ignored: they must not keep the
+ * process alive.
+ */
+export async function shutdown(exit: (code: number) => void = process.exit): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const flush = Promise.allSettled([
+    sdk ? sdk.shutdown() : Promise.resolve(),
+    telemetryConfig.pyroscopeAddr ? Promise.resolve(Pyroscope.stop()) : Promise.resolve(),
+  ]);
+  await Promise.race([
+    flush,
+    new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS).unref()),
+  ]);
+  exit(0);
+}
+
+process.once('SIGTERM', () => void shutdown());
+process.once('SIGINT', () => void shutdown());
 
 export { sdk };

@@ -1,4 +1,4 @@
-import { startRpcMetrics } from './telemetry'; // must be first — instruments before anything else loads
+import { startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
@@ -61,7 +61,14 @@ function main(): void {
       logger.error({ err }, 'Failed to bind gRPC server');
       process.exit(1);
     }
-    logger.info({ port: boundPort }, 'PaymentService gRPC server started');
+    logger.info(
+      {
+        port: boundPort,
+        telemetry: telemetryConfig.telemetryReason,
+        profiling: telemetryConfig.profilingReason,
+      },
+      'PaymentService gRPC server started',
+    );
   });
 }
 
