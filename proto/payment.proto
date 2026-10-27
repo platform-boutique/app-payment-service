@@ -4,6 +4,9 @@ package hipstershop;
 
 service PaymentService {
   rpc Charge(ChargeRequest) returns (ChargeResponse) {}
+  // Simulated refund of an earlier charge (additive). Idempotent: the same
+  // transaction_id always returns the same refund_id.
+  rpc Refund(RefundRequest) returns (RefundResponse) {}
 }
 
 message Money {
@@ -26,4 +29,13 @@ message ChargeRequest {
 
 message ChargeResponse {
   string transaction_id = 1;
+}
+
+message RefundRequest {
+  string transaction_id = 1;
+  Money amount = 2;
+}
+
+message RefundResponse {
+  string refund_id = 1;
 }
