@@ -142,6 +142,7 @@ describe('telemetry module', () => {
     expect(Pyroscope.start).not.toHaveBeenCalled();
     expect(mod.sdk).toBeNull();
     expect(() => mod.startRpcMetrics('Charge')(0)).not.toThrow();
+    expect(() => mod.recordPaymentOutcome('success')).not.toThrow();
 
     const exit = jest.fn();
     await mod.shutdown(exit);

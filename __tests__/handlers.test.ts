@@ -22,6 +22,7 @@ const logger = createLogger('test', {
   },
 });
 const metricCodes: Array<[string, number]> = [];
+const outcomes: string[] = [];
 const startRpcMetrics = (method: string) => (code: number) => {
   metricCodes.push([method, code]);
 };
@@ -43,7 +44,12 @@ beforeAll(async () => {
   server = new grpc.Server();
   server.addService(
     proto.PaymentService.service,
-    makeHandlers({ logger, startRpcMetrics, chargeDeps: { clock } }),
+    makeHandlers({
+      logger,
+      startRpcMetrics,
+      chargeDeps: { clock },
+      recordPaymentOutcome: (o) => outcomes.push(o),
+    }),
   );
   const port = await new Promise<number>((resolve, reject) =>
     server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (err, p) =>
@@ -61,6 +67,7 @@ afterAll(() => {
 beforeEach(() => {
   lines.length = 0;
   metricCodes.length = 0;
+  outcomes.length = 0;
 });
 
 function call<T>(method: 'Charge' | 'Refund', req: unknown): Promise<T> {
@@ -98,6 +105,33 @@ function expectNoCardDataInLogs(cardNumber: string) {
     }
   }
 }
+
+describe('payment outcome counter', () => {
+  it.each([
+    ['4111111111111111', 'success'],
+    ['1234567890123456', 'invalid_card'],
+    ['371449635398431', 'card_not_accepted'],
+    [TEST_CARDS.DECLINED, 'card_declined'],
+    [TEST_CARDS.INSUFFICIENT_FUNDS, 'insufficient_funds'],
+    [TEST_CARDS.PROCESSING_ERROR, 'processing_error'],
+  ])('%s is counted once as %s', async (card, outcome) => {
+    await call('Charge', chargeReq(card)).catch(() => undefined);
+    expect(outcomes).toEqual([outcome]);
+  });
+
+  it('an expired card and a charge without an amount are counted by their reason', async () => {
+    const expired = chargeReq('4111111111111111');
+    expired.credit_card.credit_card_expiration_year = 2000;
+    await call('Charge', expired).catch(() => undefined);
+    await call('Charge', { ...chargeReq('4111111111111111'), amount: null }).catch(() => undefined);
+    expect(outcomes).toEqual(['expired_card', 'invalid_request']);
+  });
+
+  it('Refund is not counted as a charge', async () => {
+    await call('Refund', { transaction_id: 'x' }).catch(() => undefined);
+    expect(outcomes).toEqual([]);
+  });
+});
 
 describe('Charge over gRPC', () => {
   it.each(['4111111111111111', '5555555555554444'])('%s succeeds', async (card) => {

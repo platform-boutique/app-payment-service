@@ -11,12 +11,12 @@ Part of the [platform-demo](https://github.com/platform-boutique) platform — m
 | **Language / runtime** | TypeScript on Node.js 22 (`@grpc/grpc-js`) |
 | **Image** | `mladenovskistefan/payment-service` |
 | **Protocol / port** | gRPC (HTTP/2, plaintext) on `50051` |
-| **Metrics** | Pushed over OTLP/gRPC to Alloy → Mimir every 15 s (no scrape endpoint). Dashboard names: `rpc_server_duration_seconds_{bucket,count,sum}`, `rpc_server_requests_total`, `rpc_server_active_requests` |
+| **Metrics** | Pushed over OTLP/gRPC to Alloy → Mimir every 15 s (no scrape endpoint). Dashboard names: `rpc_server_duration_seconds_{bucket,count,sum}`, `rpc_server_requests_total`, `rpc_server_active_requests`, `build_info`, `payment_charges_total` |
 | **Health** | `grpc.health.v1.Health/Check` on `50051` — static `SERVING` |
 | **State** | None |
 | **Depends on** | Nothing (optional: OTLP collector, Pyroscope) |
 | **Called by** | `checkout-service` (`Charge`; `Refund` is not called yet) |
-| **gRPC reflection** | Not enabled — pass `-proto` to `grpcurl` |
+| **gRPC reflection** | Enabled (v1 and v1alpha, `@grpc/reflection`): `grpcurl -plaintext localhost:50051 list` works without the proto files |
 
 ## API
 
@@ -194,7 +194,7 @@ and was verified in the earlier local phase on a 3-node kind cluster (since dele
 | **Logs** | `pino` JSON to stdout in the shared shape (`timestamp`, `severity`, `message`, `service`, `version`, `trace_id`, `span_id`, `error`; `trace_id`/`span_id` come from the active span via a pino `mixin`) **and** `@opentelemetry/instrumentation-pino` forwarding records over OTLP/gRPC (log correlation of that instrumentation is off, so there is no duplicate field) | stdout → Alloy → Loki; OTLP → Alloy → Loki |
 | **Profiles** | `@pyroscope/nodejs`, only with `PYROSCOPE_ADDR`; tags `service_name`, `version`, `environment` | Alloy `:4040` → Pyroscope |
 
-Metric names: `rpc_server_duration_seconds_{bucket,count,sum}` (buckets 1 ms … 10 s; the unit `s` yields the `_seconds` suffix), `rpc_server_requests_total`, `rpc_server_active_requests` (labels `rpc_system`, `rpc_service`, `rpc_method`, `rpc_grpc_status_code`), plus `nodejs_*` runtime gauges (heap, RSS, CPU, event-loop lag, active handles). The event-loop lag is sampled with Node's `monitorEventLoopDelay` histogram — the earlier self-rescheduling `setTimeout(0)` probe kept an idle pod at ~25 % CPU, which would have kept an HPA scaling out.
+Metric names: `rpc_server_duration_seconds_{bucket,count,sum}` (buckets 1 ms … 10 s; the unit `s` yields the `_seconds` suffix), `rpc_server_requests_total`, `rpc_server_active_requests` (labels `rpc_system`, `rpc_service`, `rpc_method`, `rpc_grpc_status_code`), plus `nodejs_*` runtime gauges (heap, RSS, CPU, event-loop lag, active handles), `build_info{service,version,commit}` (always 1) and `payment_charges_total{outcome}` (one increment per finished Charge: `success` or the failure reason, i.e. `invalid_card`, `card_not_accepted`, `expired_card`, `card_declined`, `insufficient_funds`, `processing_error`, `invalid_request`, `internal_error`; no card data in labels). The event-loop lag is sampled with Node's `monitorEventLoopDelay` histogram — the earlier self-rescheduling `setTimeout(0)` probe kept an idle pod at ~25 % CPU, which would have kept an HPA scaling out.
 
 Every series carries `job="payment-service"` (from `service.name`) and `instance=<pod name>` (`service.instance.id`), which is what the Grafana dashboards select on. Logs land in Loki with `service_name="payment-service"` and trace/span ids, so a log line links to its trace.
 
@@ -215,7 +215,7 @@ docker build -t payment-service .
 docker run --rm -p 50051:50051 -e PORT=50051 payment-service
 ```
 
-### Manual gRPC testing (no reflection — pass the proto)
+### Manual gRPC testing (reflection is on; `-proto` also works)
 
 ```bash
 grpcurl -plaintext -proto proto/payment.proto -d '{

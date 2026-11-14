@@ -9,6 +9,7 @@ import {
 import { refund, type RefundRequest, type RefundResponse } from './refund';
 import { PaymentError, toGrpcError } from './errors';
 import type { Logger } from './logger';
+import type { PaymentOutcome } from './metrics';
 
 /** Starts an RPC measurement; the returned function records the final status code. */
 export type StartRpcMetrics = (method: string) => (code: number) => void;
@@ -17,6 +18,8 @@ export interface HandlerDeps {
   logger: Logger;
   startRpcMetrics: StartRpcMetrics;
   chargeDeps?: ChargeDeps;
+  /** Counts a finished Charge call by outcome; defaults to a no-op. */
+  recordPaymentOutcome?: (outcome: PaymentOutcome) => void;
 }
 
 /**
@@ -24,7 +27,12 @@ export interface HandlerDeps {
  * object, the card number or the CVV; card data is logged only as brand and
  * last four digits (maskCard).
  */
-export function makeHandlers({ logger, startRpcMetrics, chargeDeps }: HandlerDeps) {
+export function makeHandlers({
+  logger,
+  startRpcMetrics,
+  chargeDeps,
+  recordPaymentOutcome = () => undefined,
+}: HandlerDeps) {
   function chargeHandler(
     call: grpc.ServerUnaryCall<ChargeRequest, ChargeResponse>,
     callback: grpc.sendUnaryData<ChargeResponse>,
@@ -40,10 +48,12 @@ export function makeHandlers({ logger, startRpcMetrics, chargeDeps }: HandlerDep
     charge(req, { logger, ...chargeDeps }).then(
       (response) => {
         endMetrics(grpc.status.OK);
+        recordPaymentOutcome('success');
         callback(null, response);
       },
       (err: unknown) => {
         const { code, message } = toGrpcError(err);
+        recordPaymentOutcome(err instanceof PaymentError ? err.reason : 'internal_error');
         if (err instanceof PaymentError) {
           logger.warn(
             { card, reason: err.reason, grpc_code: code, error: err.reason },

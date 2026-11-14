@@ -15,7 +15,7 @@ docker build -t payment-service .
 docker run --rm -p 50051:50051 -e PORT=50051 payment-service
 ```
 
-### Manual gRPC testing (no reflection — pass the proto)
+### Manual gRPC testing (reflection is on; `-proto` also works)
 
 ```bash
 grpcurl -plaintext -proto proto/payment.proto -d '{
