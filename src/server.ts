@@ -1,10 +1,16 @@
 import './fatal'; // first: uncaught errors, also while loading, are one JSON line
-import { flushTelemetry, startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
+import {
+  flushTelemetry,
+  recordPaymentOutcome,
+  startRpcMetrics,
+  telemetryConfig,
+} from './telemetry'; // must be first — instruments before anything else loads
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { createLogger } from './logger';
 import { makeHandlers } from './handlers';
+import { addReflection } from './reflection';
 import { createHealth, createShutdown, drainTimeoutFromEnv } from './lifecycle';
 
 // ---------------------------------------------------------------------------
@@ -22,25 +28,26 @@ const logger = createLogger(telemetryConfig.serviceName, undefined, {
 const PAYMENT_PROTO_PATH = path.join(__dirname, '../proto/payment.proto');
 const HEALTH_PROTO_PATH = path.join(__dirname, '../proto/health.proto');
 
-function loadProto(protoPath: string) {
-  const packageDefinition = protoLoader.loadSync(protoPath, {
+function loadDefinition(protoPath: string) {
+  return protoLoader.loadSync(protoPath, {
     keepCase: true,
     longs: String,
     enums: String,
     defaults: true,
     oneofs: true,
   });
-  return grpc.loadPackageDefinition(packageDefinition);
 }
 
-const paymentProto = (loadProto(PAYMENT_PROTO_PATH) as any).hipstershop;
-const healthProto = (loadProto(HEALTH_PROTO_PATH) as any).grpc.health.v1;
+const paymentDefinition = loadDefinition(PAYMENT_PROTO_PATH);
+const healthDefinition = loadDefinition(HEALTH_PROTO_PATH);
+const paymentProto = (grpc.loadPackageDefinition(paymentDefinition) as any).hipstershop;
+const healthProto = (grpc.loadPackageDefinition(healthDefinition) as any).grpc.health.v1;
 
 // ---------------------------------------------------------------------------
 // gRPC handlers (src/handlers.ts)
 // ---------------------------------------------------------------------------
 
-const handlers = makeHandlers({ logger, startRpcMetrics });
+const handlers = makeHandlers({ logger, startRpcMetrics, recordPaymentOutcome });
 
 const health = createHealth();
 
@@ -54,6 +61,7 @@ function main(): void {
   const server = new grpc.Server();
   server.addService(paymentProto.PaymentService.service, handlers);
   server.addService(healthProto.Health.service, { check: health.check });
+  addReflection(server, paymentDefinition, healthDefinition);
 
   server.bindAsync(`[::]:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {

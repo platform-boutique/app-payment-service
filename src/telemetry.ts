@@ -13,6 +13,7 @@ import { monitorEventLoopDelay } from 'perf_hooks';
 import Pyroscope from '@pyroscope/nodejs';
 
 import { pyroscopeTags, resolveTelemetryConfig, resourceAttributes } from './telemetry-config';
+import { createPaymentOutcomeCounter, registerBuildInfo } from './metrics';
 
 // Telemetry contract: see telemetry-config.ts. With nothing set, no SDK and no
 // profiler start, so the service makes no outbound connections.
@@ -64,6 +65,11 @@ const sdk: NodeSDK | null = telemetryConfig.otlpEndpoint
 
 const meter = api.metrics.getMeter('payment-service-grpc');
 const runtimeMeter = api.metrics.getMeter('payment-service-runtime');
+
+registerBuildInfo(runtimeMeter, telemetryConfig);
+
+/** Counts a finished Charge call by outcome (payment_charges_total{outcome}). */
+export const recordPaymentOutcome = createPaymentOutcomeCounter(meter);
 
 const rpcServerDuration = meter.createHistogram('rpc_server_duration', {
   description: 'Duration of inbound gRPC calls in seconds',
