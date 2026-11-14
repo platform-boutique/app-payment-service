@@ -45,10 +45,19 @@ export function makeHandlers({ logger, startRpcMetrics, chargeDeps }: HandlerDep
       (err: unknown) => {
         const { code, message } = toGrpcError(err);
         if (err instanceof PaymentError) {
-          logger.warn({ card, reason: err.reason, grpc_code: code }, 'Charge failed');
+          logger.warn(
+            { card, reason: err.reason, grpc_code: code, error: err.reason },
+            'Charge failed',
+          );
         } else {
+          const errorName = err instanceof Error ? err.name : typeof err;
           logger.error(
-            { card, grpc_code: code, error_name: err instanceof Error ? err.name : typeof err },
+            {
+              card,
+              grpc_code: code,
+              error_name: errorName,
+              error: errorName,
+            },
             'Charge failed unexpectedly',
           );
         }

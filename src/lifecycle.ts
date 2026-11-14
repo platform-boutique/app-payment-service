@@ -71,7 +71,7 @@ async function run({
   let timer: NodeJS.Timeout | undefined;
   const drained = new Promise<'drained'>((resolve) => {
     server.tryShutdown((err) => {
-      if (err) logger.warn({ err: err.message }, 'Shutdown: tryShutdown reported an error');
+      if (err) logger.warn({ error: err }, 'Shutdown: tryShutdown reported an error');
       resolve('drained');
     });
   });

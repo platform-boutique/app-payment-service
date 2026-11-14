@@ -1,3 +1,4 @@
+import './fatal'; // first: uncaught errors, also while loading, are one JSON line
 import { flushTelemetry, startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
@@ -10,7 +11,9 @@ import { createHealth, createShutdown, drainTimeoutFromEnv } from './lifecycle';
 // Logger
 // ---------------------------------------------------------------------------
 
-const logger = createLogger('payment-service');
+const logger = createLogger(telemetryConfig.serviceName, undefined, {
+  version: telemetryConfig.serviceVersion,
+});
 
 // ---------------------------------------------------------------------------
 // Proto loading
@@ -54,16 +57,17 @@ function main(): void {
 
   server.bindAsync(`[::]:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {
-      logger.error({ err }, 'Failed to bind gRPC server');
+      logger.error({ error: err }, 'Failed to bind gRPC server');
       process.exit(1);
     }
     logger.info(
       {
+        commit: telemetryConfig.serviceCommit,
         port: boundPort,
         telemetry: telemetryConfig.telemetryReason,
         profiling: telemetryConfig.profilingReason,
       },
-      'PaymentService gRPC server started',
+      'starting',
     );
   });
 

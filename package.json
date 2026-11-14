@@ -36,6 +36,7 @@
     "uuid": "^9.0.0"
   },
   "devDependencies": {
+    "@opentelemetry/context-async-hooks": "2.12.0",
     "@types/jest": "^29.5.0",
     "@types/node": "^22.0.0",
     "@types/uuid": "^10.0.0",
