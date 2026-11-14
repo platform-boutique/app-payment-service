@@ -1,22 +1,18 @@
-import { startRpcMetrics } from './telemetry'; // must be first — instruments before anything else loads
+import './fatal'; // first: uncaught errors, also while loading, are one JSON line
+import { flushTelemetry, startRpcMetrics, telemetryConfig } from './telemetry'; // must be first — instruments before anything else loads
 import path from 'path';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
-import { pino } from 'pino';
-import { charge } from './charge';
+import { createLogger } from './logger';
+import { makeHandlers } from './handlers';
+import { createHealth, createShutdown, drainTimeoutFromEnv } from './lifecycle';
 
 // ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
 
-const logger = pino({
-  name: 'payment-service',
-  messageKey: 'message',
-  formatters: {
-    level(label) {
-      return { severity: label };
-    },
-  },
+const logger = createLogger(telemetryConfig.serviceName, undefined, {
+  version: telemetryConfig.serviceVersion,
 });
 
 // ---------------------------------------------------------------------------
@@ -41,61 +37,12 @@ const paymentProto = (loadProto(PAYMENT_PROTO_PATH) as any).hipstershop;
 const healthProto = (loadProto(HEALTH_PROTO_PATH) as any).grpc.health.v1;
 
 // ---------------------------------------------------------------------------
-// Types
+// gRPC handlers (src/handlers.ts)
 // ---------------------------------------------------------------------------
 
-interface Money {
-  currency_code: string;
-  units: number;
-  nanos: number;
-}
+const handlers = makeHandlers({ logger, startRpcMetrics });
 
-interface CreditCardInfo {
-  credit_card_number: string;
-  credit_card_cvv: number;
-  credit_card_expiration_year: number;
-  credit_card_expiration_month: number;
-}
-
-interface ChargeRequest {
-  amount: Money;
-  credit_card: CreditCardInfo;
-}
-
-interface ChargeResponse {
-  transaction_id: string;
-}
-
-// ---------------------------------------------------------------------------
-// gRPC handlers
-// ---------------------------------------------------------------------------
-
-function chargeHandler(
-  call: grpc.ServerUnaryCall<ChargeRequest, ChargeResponse>,
-  callback: grpc.sendUnaryData<ChargeResponse>,
-): void {
-  const endMetrics = startRpcMetrics('Charge');
-  try {
-    logger.info({ request: call.request }, 'PaymentService#Charge invoked');
-    const response = charge(call.request);
-    endMetrics(grpc.status.OK);
-    callback(null, response);
-  } catch (err: any) {
-    logger.warn({ err }, 'Charge failed');
-    endMetrics(grpc.status.INVALID_ARGUMENT);
-    callback({
-      code: grpc.status.INVALID_ARGUMENT,
-      message: err.message ?? 'Charge failed',
-    });
-  }
-}
-
-function check(
-  _call: grpc.ServerUnaryCall<unknown, unknown>,
-  callback: grpc.sendUnaryData<{ status: string }>,
-): void {
-  callback(null, { status: 'SERVING' });
-}
+const health = createHealth();
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -105,16 +52,37 @@ function main(): void {
   const port = process.env.PORT ?? '50051';
 
   const server = new grpc.Server();
-  server.addService(paymentProto.PaymentService.service, { charge: chargeHandler });
-  server.addService(healthProto.Health.service, { check });
+  server.addService(paymentProto.PaymentService.service, handlers);
+  server.addService(healthProto.Health.service, { check: health.check });
 
   server.bindAsync(`[::]:${port}`, grpc.ServerCredentials.createInsecure(), (err, boundPort) => {
     if (err) {
-      logger.error({ err }, 'Failed to bind gRPC server');
+      logger.error({ error: err }, 'Failed to bind gRPC server');
       process.exit(1);
     }
-    logger.info({ port: boundPort }, 'PaymentService gRPC server started');
+    logger.info(
+      {
+        commit: telemetryConfig.serviceCommit,
+        port: boundPort,
+        telemetry: telemetryConfig.telemetryReason,
+        profiling: telemetryConfig.profilingReason,
+      },
+      'starting',
+    );
   });
+
+  // SIGTERM/SIGINT: health -> NOT_SERVING, wait for in-flight calls (tryShutdown, bounded),
+  // flush telemetry, exit 0. A second signal is not intercepted and kills the process.
+  const shutdown = createShutdown({
+    server,
+    health,
+    flushTelemetry,
+    exit: process.exit,
+    logger,
+    drainTimeoutMs: drainTimeoutFromEnv(),
+  });
+  process.once('SIGTERM', () => void shutdown());
+  process.once('SIGINT', () => void shutdown());
 }
 
 main();

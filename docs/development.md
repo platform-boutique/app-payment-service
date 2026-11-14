@@ -24,6 +24,17 @@ grpcurl -plaintext -proto proto/payment.proto -d '{
                   "credit_card_expiration_year": 2030, "credit_card_expiration_month": 12}
 }' localhost:50051 hipstershop.PaymentService/Charge
 
+# a declined card: FAILED_PRECONDITION "card_declined: ..."
+grpcurl -plaintext -proto proto/payment.proto -d '{
+  "amount": {"currency_code": "USD", "units": 50},
+  "credit_card": {"credit_card_number": "4000000000000002", "credit_card_cvv": 123,
+                  "credit_card_expiration_year": 2030, "credit_card_expiration_month": 12}
+}' localhost:50051 hipstershop.PaymentService/Charge
+
+# same transaction id -> same refund id
+grpcurl -plaintext -proto proto/payment.proto -d '{"transaction_id": "abc"}' \
+  localhost:50051 hipstershop.PaymentService/Refund
+
 grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Health/Check
 ```
 
@@ -31,11 +42,19 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ```
 ├── src/
-│   ├── server.ts        # gRPC bootstrap, Charge + Check handlers
-│   ├── charge.ts        # card validation and fake charge (CreditCardError classes)
-│   ├── telemetry.ts     # OTel SDK, Prometheus exporter, RPC metrics, runtime gauges, Pyroscope
+│   ├── server.ts        # gRPC bootstrap, wires handlers.ts and the shutdown
+│   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
+│   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
+│   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
+│   ├── refund.ts        # simulated, idempotent refund
+│   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
+│   ├── logger.ts        # pino factory: shared log shape, trace ids, card-field redaction
+│   ├── fatal.ts         # uncaught exceptions / rejections as one JSON line, exit 1
+│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
+│   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
-├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader)
+├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
+├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile
 ├── .dockerignore / .nvmrc / .eslintrc.cjs / .prettierrc / .trivyignore

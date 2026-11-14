@@ -1,6 +1,6 @@
 # payment-service
 
-A gRPC service that "processes" payments for the platform-demo e-commerce platform. It validates a credit card (number checksum, brand, expiry) and returns a random transaction ID. **No real payment provider is involved and nothing is persisted** — it is a simulation. It is stateless, has no downstream dependencies, and is called only by `checkout-service`.
+A gRPC service that "processes" payments for the platform-demo e-commerce platform. It validates a credit card (number checksum, brand, expiry), simulates declines and processor errors for documented test cards, returns a random transaction ID, and simulates refunds. **No real payment provider is involved and nothing is persisted** — it is a simulation. It is stateless, has no downstream dependencies, and is called only by `checkout-service`.
 
 Part of the [platform-demo](https://github.com/platform-boutique) platform — microservices, observability (LGTM stack), GitOps (Argo CD), policy enforcement (Kyverno), infrastructure provisioning (Terraform) and an internal developer portal (Backstage). See the master `README.md` in the platform-demo root for the whole-system view.
 
@@ -15,7 +15,7 @@ Part of the [platform-demo](https://github.com/platform-boutique) platform — m
 | **Health** | `grpc.health.v1.Health/Check` on `50051` — static `SERVING` |
 | **State** | None |
 | **Depends on** | Nothing (optional: OTLP collector, Pyroscope) |
-| **Called by** | `checkout-service` (`Charge`) |
+| **Called by** | `checkout-service` (`Charge`; `Refund` is not called yet) |
 | **gRPC reflection** | Not enabled — pass `-proto` to `grpcurl` |
 
 ## API
@@ -25,37 +25,89 @@ Package `hipstershop`, service `PaymentService` ([`proto/payment.proto`](proto/p
 | Method | Request | Response |
 |---|---|---|
 | `Charge` | `ChargeRequest{ Money amount, CreditCardInfo credit_card }` | `ChargeResponse{ transaction_id }` (a random UUID v4) |
+| `Refund` | `RefundRequest{ string transaction_id, Money amount }` | `RefundResponse{ refund_id }` |
 
-`CreditCardInfo` = `{ credit_card_number, credit_card_cvv, credit_card_expiration_year, credit_card_expiration_month }`.
+`CreditCardInfo` = `{ credit_card_number, credit_card_cvv, credit_card_expiration_year, credit_card_expiration_month }`. `Refund` (with `RefundRequest`/`RefundResponse`) is an additive change; `Charge` and every existing field number are unchanged.
 
-Validation rules (any failure → gRPC `INVALID_ARGUMENT` with a message):
+### Charge
 
-1. Number must pass `simple-card-validator` (Luhn + known brand) — "Credit card info is invalid".
-2. Brand must be **Visa or MasterCard** — other brands are rejected ("Sorry, we cannot process … credit cards").
-3. Expiry month/year must not be in the past — "Your credit card (ending NNNN) expired on M/YYYY".
+Checks, in this order (the first failure wins):
 
-The CVV and `amount` are **not** validated. Every handler error is mapped to `INVALID_ARGUMENT`.
+1. A card must be present and the number must pass `simple-card-validator` (Luhn + known brand; spaces and dashes are allowed).
+2. Brand must be **Visa or MasterCard**.
+3. CVV must be an integer 0-9999 (`credit_card_cvv` is an `int32`, so leading zeros are already lost: `012` arrives as 12, and a missing CVV arrives as 0; the check therefore rejects only values that cannot be a 3-4 digit CVV). The CVV is never logged or echoed in an error. Otherwise it is not verified.
+4. Expiry month/year must not be in the past (a card expiring this month passes).
+5. `amount` must be present, `units` an integer that is not negative, `nanos` an integer 0-999999999.
+6. The documented test cards below then produce their simulated outcome; every other valid card succeeds.
 
-Test cards that pass: Visa `4111111111111111`, MasterCard `5555555555554444` (any future expiry). Amex `378282246310005` is rejected.
+### Test cards
+
+Use any future expiry and any CVV.
+
+| Card number | Brand | Outcome | gRPC status | Message prefix |
+|---|---|---|---|---|
+| `4111111111111111` | Visa | success | `OK` | — |
+| `5555555555554444` | MasterCard | success | `OK` | — |
+| `4000000000000002` | Visa | generic decline | `FAILED_PRECONDITION` | `card_declined: ` |
+| `4000000000009995` | Visa | insufficient funds | `FAILED_PRECONDITION` | `insufficient_funds: ` |
+| `4000000000000119` | Visa | processing error after a **~3 s delay**; retriable | `UNAVAILABLE` | `processing_error: ` |
+| `378282246310005` / `371449635398431` | Amex | brand not accepted | `INVALID_ARGUMENT` | `card_not_accepted: ` |
+
+### Error mapping
+
+Every error message is `<reason>: <human text>`; the reason is stable and machine-readable, the text is for people and may change.
+
+| Failure | gRPC status | Reason prefix | Example message |
+|---|---|---|---|
+| Missing card, Luhn/length failure, unknown brand, expiration month outside 1-12, CVV outside 0-9999 | `INVALID_ARGUMENT` | `invalid_card` | `invalid_card: Credit card info is invalid` (CVV: `invalid_card: Credit card info is invalid: CVV must be 3 or 4 digits`) |
+| Brand other than Visa/MasterCard | `INVALID_ARGUMENT` | `card_not_accepted` | `card_not_accepted: Sorry, we cannot process amex credit cards. Only VISA or MasterCard is accepted.` |
+| Expired card | `INVALID_ARGUMENT` | `expired_card` | `expired_card: Your credit card (ending 1111) expired on 1/2025` |
+| Declined | `FAILED_PRECONDITION` | `card_declined` | `card_declined: Your card (ending 0002) was declined by the issuer` |
+| Insufficient funds | `FAILED_PRECONDITION` | `insufficient_funds` | `insufficient_funds: Your card (ending 9995) has insufficient funds` |
+| Processor error (retry later) | `UNAVAILABLE` | `processing_error` | `processing_error: The payment processor could not complete the charge; please retry` |
+| Charge with a missing, negative or malformed amount (non-integer units, nanos outside 0-999999999) | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: amount is required` / `amount must not be negative` / `amount.nanos must be an integer between 0 and 999999999` |
+| Refund without `transaction_id`, negative or malformed refund amount | `INVALID_ARGUMENT` | `invalid_request` | `invalid_request: transaction_id is required` |
+| Anything unexpected | `INTERNAL` | `internal_error` | `internal_error: unexpected payment failure` (the real exception text is never returned) |
+
+`checkout-service` currently wraps every payment error as `INTERNAL "failed to charge card: ..."`, so the code is lost there but the reason prefix survives inside the message.
+
+### Refund
+
+Simulated: nothing is stored and the transaction is **not looked up** (the service keeps no state), so any non-empty `transaction_id` is accepted. Blank (or whitespace-only) → `INVALID_ARGUMENT`; a negative or malformed `amount` (units not an integer, nanos not an integer in 0-999999999) → `INVALID_ARGUMENT` (the same check as `Charge`); `amount` is otherwise not checked against the charge. `refund_id` is a UUID v5 of the trimmed transaction id, so **the same transaction id always returns the same refund id** (safe to retry), whatever the amount.
+
+### Card data in logs and traces
+
+No log line, error message or span attribute contains a full card number or the CVV; the most that is logged is the brand and the last four digits (`"card":{"brand":"visa","last4":"1111"}`). The request object is not logged. As defence in depth the pino loggers redact `credit_card`, `credit_card_number` and `credit_card_cvv` (top level and one/two levels deep) to `[REDACTED]`. The gRPC instrumentation records the status message as a span attribute (`grpc.error_message`), which is why error messages carry at most the last four digits; it records no request payload or metadata (no metadata capture is configured). `__tests__/handlers.test.ts` captures the logger and fails if a full number, its first six digits or the CVV appears in the logs of any charge path.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `50051` | gRPC listen port. **Must be set when relying on the Docker `HEALTHCHECK`** (see below) |
+| `PORT` | `50051` | gRPC listen port (the Docker `HEALTHCHECK` falls back to 50051 too) |
+| `SHUTDOWN_DRAIN_TIMEOUT_MS` | `5000` | On `SIGTERM`/`SIGINT`: how long to wait for in-flight calls before cancelling them (positive integer; anything else uses the default) |
 | `NODE_ENV` | `production` (set in image) | |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP/**gRPC** endpoint for **traces, metrics and logs** (scheme required), e.g. `http://alloy.monitoring.svc.cluster.local:4317`. Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for **traces, metrics and logs**, an absolute `http(s)://host:port` URL, e.g. `http://alloy.monitoring.svc.cluster.local:4317`. Telemetry is on **only if** it is set to a valid URL; empty or malformed (`alloy:4317`, `http://`) means off, never a crash. The legacy `COLLECTOR_SERVICE_ADDR` and `ENABLE_TRACING` are no longer read |
+| `OTEL_SDK_DISABLED` | unset | `true` (trimmed, any case) forces traces, metrics, logs **and profiling** off even if the endpoints are set |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` (fixed) | Not read: the service always exports OTLP/gRPC |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | SDK default | Read by the OpenTelemetry Node SDK itself (not run here) |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | Extra resource attributes, merged by the OpenTelemetry Node SDK (not run here); the five attributes below always come from the service |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | Milliseconds between metric pushes |
-| `OTEL_SERVICE_NAME` | `payment-service` | `service.name` — becomes the Prometheus `job` and the Loki `service_name`; keep the default, dashboards depend on it |
-| `SERVICE_VERSION` | `1.0.0` | `service.version` resource attribute |
-| `PYROSCOPE_ADDR` | `http://localhost:4040` | Profiles use the Pyroscope SDK push protocol (**not** OTLP). Point it at Alloy (`http://alloy.monitoring.svc.cluster.local:4040`), which forwards to Pyroscope, or directly at Pyroscope |
+| `OTEL_SERVICE_NAME` | `payment-service` | `service.name`; becomes the Prometheus `job` and the Loki `service_name`; keep the default, dashboards depend on it |
+| `SERVICE_VERSION` | `dev` | `service.version` resource attribute and the `version` field of every log line and Pyroscope tag |
+| `SERVICE_COMMIT` | `unknown` | Commit id, logged once in the `starting` line (the image build does not set it yet) |
+| `DEPLOYMENT_ENVIRONMENT` | `local` | `deployment.environment` resource attribute, Pyroscope tag `environment` |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warning` (or `warn`) or `error`, any case; anything else means `info` |
+| `PYROSCOPE_ADDR` | unset (profiling off) | Absolute `http(s)` URL. Profiles use the Pyroscope SDK push protocol (**not** OTLP). Point it at Alloy (`http://alloy.monitoring.svc.cluster.local:4040`), which forwards to Pyroscope, or directly at Pyroscope. There is no default address: profiling is on **only if** it is set to a valid URL |
+| `ENABLE_PROFILING` | unset | `0` or `false` forces profiling off even if `PYROSCOPE_ADDR` is set; `1` alone starts nothing |
 
 Notes:
 
 - There are **no secrets** and no external credentials: the service never talks to a real processor.
 - Telemetry is **pushed**, not scraped: traces, metrics and logs share one OTLP/gRPC endpoint (Alloy); profiles go to Pyroscope (via Alloy). `service.instance.id` is the pod hostname, so replicas stay distinct in Mimir.
 - The former Prometheus endpoint (`METRICS_PORT`) no longer exists. Logs keep going to stdout and are additionally exported over OTLP with trace ids.
-- Telemetry and profiling cannot be switched off with a flag; with no reachable collector the exporters just log errors and the service keeps serving.
+- With nothing set the service starts with telemetry and profiling **off**, makes no outbound connections and logs no connection errors; the `starting` line says what is on (`"telemetry":"off: no OTEL_EXPORTER_OTLP_ENDPOINT","profiling":"off: no PYROSCOPE_ADDR"`). With telemetry off, logs still go to stdout (without trace ids). If an endpoint is set but unreachable the service keeps serving and, on `SIGTERM`, flushes for at most 3 s after the drain, so it exits well within 10 s (tested against a collector port that accepts connections and never answers).
+- Resource attributes on every signal: `service.name`, `service.version`, `service.namespace=everly`, `deployment.environment`, `service.instance.id` (the hostname). Pyroscope tags: `service_name`, `version`, `environment`.
+- Logs: one JSON object per line on stdout, fields `timestamp` (RFC3339 UTC, milliseconds), `severity` (`debug`, `info`, `warning`, `error`), `message`, `service`, `version`, `trace_id` and `span_id` (only while a span is active, i.e. while a gRPC call is handled) and `error` (a string, never a stack). Uncaught exceptions and unhandled rejections are one JSON line too, then exit code 1.
 
 ## Container image
 
@@ -67,9 +119,9 @@ Multi-stage [`Dockerfile`](Dockerfile):
 | runtime | `node:22.22.2-alpine3.23` | copies `node_modules`, `dist/`, `proto/`; runs as non-root |
 
 - **Entrypoint:** `node dist/server.js` (working dir `/app`).
-- **User:** `appuser` — UID `100`, GID `101` (verified). Set `runAsUser: 100` for `runAsNonRoot`.
+- **User:** numeric `USER 10001:10001` (`appuser`/`appgroup`, created with these fixed ids; `id` in the container prints `uid=10001(appuser) gid=10001(appgroup)`). Build args `SERVICE_VERSION` (default `dev`) and `SERVICE_COMMIT` (default `unknown`) set the OCI labels `version`/`revision` (plus `source`, `licenses=Apache-2.0`) and the ENV of the same names.
 - **EXPOSE:** `50051` only.
-- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It reads `process.env.PORT` with no default, so it **fails if `PORT` is unset**. Kubernetes ignores it, but set `PORT` explicitly.
+- **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It uses `process.env.PORT || 50051`, the same default as the server (fixed in 719ce3d; the probe command was run against the server, the image itself was not rebuilt). Kubernetes ignores it.
 - **Image size:** ~73 MB.
 
 ## Kubernetes deployment notes
@@ -99,14 +151,14 @@ livenessProbe:
 
 (The Node health handler implements `Check` only; `grpc:` probes only call `Check`.)
 
-**Graceful shutdown:** a `SIGTERM` handler flushes OpenTelemetry/Pyroscope but never exits the process, so Node runs until `SIGKILL`. Set `terminationGracePeriodSeconds: 5`.
+**Graceful shutdown:** on `SIGTERM` (or `SIGINT`) the health service switches to `NOT_SERVING`, the server stops accepting calls and waits for in-flight RPCs (a `Charge` in progress is answered, not cut off) for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5000; calls still running after that are cancelled), then OpenTelemetry/Pyroscope are flushed (at most 3 s) and the process exits with code 0. Worst case 8 s with the defaults, so set `terminationGracePeriodSeconds: 10` (the old value 5 can cut a slow charge). Verified with a built `dist/server.js`: a `Charge` with the 3 s processing-error card, `SIGTERM` after 0.5 s: the call was answered with `processing_error` at ~2.5 s, exit code 0; a new connection during the drain is refused, so a readiness probe fails. A second signal is not intercepted and kills the process at once.
 
 **Security context**
 
 ```yaml
 securityContext:
   runAsNonRoot: true
-  runAsUser: 100
+  runAsUser: 10001
   runAsGroup: 101
   allowPrivilegeEscalation: false
   capabilities: { drop: ["ALL"] }
@@ -139,12 +191,14 @@ and was verified in the earlier local phase on a 3-node kind cluster (since dele
 |---|---|---|
 | **Traces** | OpenTelemetry `NodeSDK` + `GrpcInstrumentation`, OTLP/gRPC exporter (`BatchSpanProcessor`) | Alloy `:4317` → Tempo |
 | **Metrics** | Hand-rolled RPC instruments (`GrpcInstrumentation` emits traces only) + Node runtime gauges, `PeriodicExportingMetricReader` over OTLP/gRPC every 15 s (replaces the Prometheus exporter) | Alloy → Mimir |
-| **Logs** | `pino` JSON to stdout **and** `@opentelemetry/instrumentation-pino` forwarding records over OTLP/gRPC with trace ids | Alloy → Loki |
-| **Profiles** | `@pyroscope/nodejs`, tagged with `version` | Alloy `:4040` → Pyroscope |
+| **Logs** | `pino` JSON to stdout in the shared shape (`timestamp`, `severity`, `message`, `service`, `version`, `trace_id`, `span_id`, `error`; `trace_id`/`span_id` come from the active span via a pino `mixin`) **and** `@opentelemetry/instrumentation-pino` forwarding records over OTLP/gRPC (log correlation of that instrumentation is off, so there is no duplicate field) | stdout → Alloy → Loki; OTLP → Alloy → Loki |
+| **Profiles** | `@pyroscope/nodejs`, only with `PYROSCOPE_ADDR`; tags `service_name`, `version`, `environment` | Alloy `:4040` → Pyroscope |
 
 Metric names: `rpc_server_duration_seconds_{bucket,count,sum}` (buckets 1 ms … 10 s; the unit `s` yields the `_seconds` suffix), `rpc_server_requests_total`, `rpc_server_active_requests` (labels `rpc_system`, `rpc_service`, `rpc_method`, `rpc_grpc_status_code`), plus `nodejs_*` runtime gauges (heap, RSS, CPU, event-loop lag, active handles). The event-loop lag is sampled with Node's `monitorEventLoopDelay` histogram — the earlier self-rescheduling `setTimeout(0)` probe kept an idle pod at ~25 % CPU, which would have kept an HPA scaling out.
 
 Every series carries `job="payment-service"` (from `service.name`) and `instance=<pod name>` (`service.instance.id`), which is what the Grafana dashboards select on. Logs land in Loki with `service_name="payment-service"` and trace/span ids, so a log line links to its trace.
+
+Metrics are pushed over OTLP (RED series above); this service has no Prometheus `/metrics` endpoint and none is planned (OBS-20 allows OTLP push for non-Go services). `service.version` comes from `SERVICE_VERSION` (default `dev`) and is logged once, with the commit, in the `starting` line.
 
 ## Running locally
 
@@ -170,6 +224,17 @@ grpcurl -plaintext -proto proto/payment.proto -d '{
                   "credit_card_expiration_year": 2030, "credit_card_expiration_month": 12}
 }' localhost:50051 hipstershop.PaymentService/Charge
 
+# a declined card: FAILED_PRECONDITION "card_declined: ..."
+grpcurl -plaintext -proto proto/payment.proto -d '{
+  "amount": {"currency_code": "USD", "units": 50},
+  "credit_card": {"credit_card_number": "4000000000000002", "credit_card_cvv": 123,
+                  "credit_card_expiration_year": 2030, "credit_card_expiration_month": 12}
+}' localhost:50051 hipstershop.PaymentService/Charge
+
+# same transaction id -> same refund id
+grpcurl -plaintext -proto proto/payment.proto -d '{"transaction_id": "abc"}' \
+  localhost:50051 hipstershop.PaymentService/Refund
+
 grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Health/Check
 ```
 
@@ -177,11 +242,19 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ```
 ├── src/
-│   ├── server.ts        # gRPC bootstrap, Charge + Check handlers
-│   ├── charge.ts        # card validation and fake charge (CreditCardError classes)
-│   ├── telemetry.ts     # OTel SDK, Prometheus exporter, RPC metrics, runtime gauges, Pyroscope
+│   ├── server.ts        # gRPC bootstrap, wires handlers.ts and the shutdown
+│   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
+│   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
+│   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
+│   ├── refund.ts        # simulated, idempotent refund
+│   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
+│   ├── logger.ts        # pino factory: shared log shape, trace ids, card-field redaction
+│   ├── fatal.ts         # uncaught exceptions / rejections as one JSON line, exit 1
+│   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
+│   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
-├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader)
+├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
+├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile
 ├── .dockerignore / .nvmrc / .eslintrc.cjs / .prettierrc / .trivyignore
@@ -190,7 +263,8 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ## Known limitations
 
-- Simulation only: no provider integration, no persistence, no idempotency (every call yields a new transaction ID).
-- Logs the raw card details (see warning above).
-- Every error is returned as `INVALID_ARGUMENT`, including unexpected internal failures.
-- `SIGTERM` does not terminate the process; the Docker `HEALTHCHECK` depends on `PORT` being set.
+- Simulation only: no provider integration and no persistence. Each `Charge` yields a new transaction ID (no idempotency key); `Refund` cannot check that the transaction exists, or that the amount does not exceed it.
+- Outcomes are keyed only on the documented test card numbers; there are no amount-based or random declines.
+- The processing-error card blocks its call for ~3 s (a timer, not CPU); callers with a deadline below 3 s see `DEADLINE_EXCEEDED` instead of `UNAVAILABLE`.
+- `checkout-service` does not call `Refund` yet and maps every payment error to `INTERNAL` (with the reason inside the message).
+- On `SIGTERM` in-flight RPCs are drained for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5 s); a call that outlasts it is cancelled. The `Check` health handler answers `NOT_SERVING` during the drain, but `Watch` is not implemented.

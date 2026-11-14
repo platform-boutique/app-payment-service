@@ -1,11 +1,15 @@
-import { charge } from '../src/charge';
+import { status } from '@grpc/grpc-js';
+import { charge, maskCard, PROCESSING_ERROR_DELAY_MS, TEST_CARDS } from '../src/charge';
+import { PaymentError, toGrpcError } from '../src/errors';
+import { createLogger } from '../src/logger';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const VALID_VISA = '4111111111111111';
-const VALID_MASTERCARD = '5500005555555559';
+const VALID_MASTERCARD = '5555555555554444';
+const VALID_MASTERCARD_2 = '5500005555555559';
 const VALID_AMEX = '371449635398431';
 const INVALID_CARD = '1234567890123456';
 
@@ -17,6 +21,16 @@ const currentMonth = new Date().getMonth() + 1;
 const pastYear = currentYear - 1;
 const pastMonth = 1;
 
+// Silent logger and an instant sleep that records what it was asked to wait.
+const silent = createLogger('test', { write: () => undefined });
+const sleeps: number[] = [];
+const deps = {
+  logger: silent,
+  sleep: async (ms: number) => {
+    sleeps.push(ms);
+  },
+};
+
 function makeRequest(overrides: {
   cardNumber?: string;
   expirationYear?: number;
@@ -24,6 +38,7 @@ function makeRequest(overrides: {
   currencyCode?: string;
   units?: number;
   nanos?: number;
+  cvv?: number;
 }) {
   return {
     amount: {
@@ -33,11 +48,21 @@ function makeRequest(overrides: {
     },
     credit_card: {
       credit_card_number: overrides.cardNumber ?? VALID_VISA,
-      credit_card_cvv: 123,
+      credit_card_cvv: overrides.cvv ?? 123,
       credit_card_expiration_year: overrides.expirationYear ?? futureYear,
       credit_card_expiration_month: overrides.expirationMonth ?? 1,
     },
   };
+}
+
+async function failure(req: Parameters<typeof charge>[0]): Promise<PaymentError> {
+  try {
+    await charge(req, deps);
+  } catch (err) {
+    expect(err).toBeInstanceOf(PaymentError);
+    return err as PaymentError;
+  }
+  throw new Error('expected charge to fail');
 }
 
 // ---------------------------------------------------------------------------
@@ -45,203 +70,276 @@ function makeRequest(overrides: {
 // ---------------------------------------------------------------------------
 
 describe('charge() — happy paths', () => {
-  it('accepts a valid VISA card and returns a transaction_id', () => {
-    const result = charge(makeRequest({ cardNumber: VALID_VISA }));
-    expect(result).toHaveProperty('transaction_id');
+  it.each([
+    ['Visa', VALID_VISA],
+    ['MasterCard', VALID_MASTERCARD],
+    ['MasterCard (2)', VALID_MASTERCARD_2],
+    ['Visa with spaces', '4111 1111 1111 1111'],
+  ])('accepts %s and returns a transaction_id', async (_name, cardNumber) => {
+    const result = await charge(makeRequest({ cardNumber }), deps);
     expect(typeof result.transaction_id).toBe('string');
     expect(result.transaction_id.length).toBeGreaterThan(0);
   });
 
-  it('accepts a valid MasterCard and returns a transaction_id', () => {
-    const result = charge(makeRequest({ cardNumber: VALID_MASTERCARD }));
-    expect(result).toHaveProperty('transaction_id');
-    expect(typeof result.transaction_id).toBe('string');
-  });
-
-  it('generates a unique transaction_id on each call', () => {
-    const r1 = charge(makeRequest({ cardNumber: VALID_VISA }));
-    const r2 = charge(makeRequest({ cardNumber: VALID_VISA }));
+  it('generates a unique transaction_id on each call', async () => {
+    const r1 = await charge(makeRequest({}), deps);
+    const r2 = await charge(makeRequest({}), deps);
     expect(r1.transaction_id).not.toBe(r2.transaction_id);
   });
 
-  it('accepts a card expiring exactly this month', () => {
-    const result = charge(
-      makeRequest({
-        cardNumber: VALID_VISA,
-        expirationYear: currentYear,
-        expirationMonth: currentMonth,
-      }),
+  it('accepts a card expiring exactly this month', async () => {
+    const result = await charge(
+      makeRequest({ expirationYear: currentYear, expirationMonth: currentMonth }),
+      deps,
     );
     expect(result).toHaveProperty('transaction_id');
   });
 
-  it('works with any currency code', () => {
-    const result = charge(makeRequest({ cardNumber: VALID_VISA, currencyCode: 'EUR' }));
-    expect(result).toHaveProperty('transaction_id');
+  it('works with any currency code', async () => {
+    await expect(charge(makeRequest({ currencyCode: 'EUR' }), deps)).resolves.toHaveProperty(
+      'transaction_id',
+    );
   });
 
-  it('works with zero-unit amounts (nanos only)', () => {
-    const result = charge(makeRequest({ cardNumber: VALID_VISA, units: 0, nanos: 500_000_000 }));
-    expect(result).toHaveProperty('transaction_id');
+  it('works with zero-unit amounts (nanos only)', async () => {
+    await expect(
+      charge(makeRequest({ units: 0, nanos: 500_000_000 }), deps),
+    ).resolves.toHaveProperty('transaction_id');
+  });
+});
+
+describe('charge() — amount validation -> INVALID_ARGUMENT', () => {
+  it('rejects a missing amount', async () => {
+    const req = { ...makeRequest({}), amount: null };
+    const err = await failure(req);
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+
+  it.each([
+    ['negative units', { units: -50 }],
+    ['negative nanos', { nanos: -1 }],
+    ['nanos above 999999999', { nanos: 1_000_000_000 }],
+  ])('rejects %s', async (_name, overrides) => {
+    const err = await failure(makeRequest(overrides));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+});
+
+describe('charge() — amount units/nanos must be integers', () => {
+  it.each([
+    ['non-numeric units', { units: 'abc' }],
+    ['fractional units', { units: 1.5 }],
+    ['NaN units', { units: NaN }],
+    ['units with a sign suffix', { units: '12-' }],
+    ['fractional nanos', { nanos: 0.5 }],
+    ['NaN nanos', { nanos: NaN }],
+  ])('rejects %s', async (_name, amountOverride) => {
+    const req = makeRequest({});
+    Object.assign(req.amount, amountOverride);
+    const err = await failure(req);
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_request');
+  });
+
+  it('accepts units as the decimal string proto-loader yields', async () => {
+    const req = makeRequest({});
+    Object.assign(req.amount, { units: '42' });
+    await expect(charge(req, deps)).resolves.toHaveProperty('transaction_id');
+  });
+});
+
+describe('charge() — CVV format -> INVALID_ARGUMENT, never echoed', () => {
+  it.each([[0], [12], [123], [999], [1234], [9999]])('accepts cvv %i', async (cvv) => {
+    await expect(charge(makeRequest({ cvv }), deps)).resolves.toHaveProperty('transaction_id');
+  });
+
+  it.each([
+    ['five digits', 12345],
+    ['negative', -123],
+    ['fractional', 12.5],
+    ['NaN', NaN],
+    ['huge', 2_000_000_000],
+  ])('rejects a cvv that is %s', async (_name, cvv) => {
+    const err = await failure(makeRequest({ cvv }));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_card');
+    expect(err.message).toBe(
+      'invalid_card: Credit card info is invalid: CVV must be 3 or 4 digits',
+    );
+    expect(err.message).not.toContain(String(cvv));
+  });
+
+  it('a missing cvv (undefined) is rejected', async () => {
+    const req = makeRequest({});
+    delete (req.credit_card as { credit_card_cvv?: number }).credit_card_cvv;
+    const err = await failure(req);
+    expect(err.reason).toBe('invalid_card');
+  });
+
+  it('does not log the cvv, also when it is rejected', async () => {
+    const lines: string[] = [];
+    const logger = createLogger('test', { write: (l: string) => void lines.push(l) });
+    await charge(makeRequest({ cvv: 4242 }), { ...deps, logger });
+    await expect(charge(makeRequest({ cvv: 777777 }), { ...deps, logger })).rejects.toBeDefined();
+    const all = lines.join('');
+    expect(all).not.toContain('4242');
+    expect(all).not.toContain('777777');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Invalid card number
+// Validation failures -> INVALID_ARGUMENT
 // ---------------------------------------------------------------------------
 
-describe('charge() — invalid card number', () => {
-  it('throws InvalidCreditCard for a Luhn-failing number', () => {
-    expect(() => charge(makeRequest({ cardNumber: INVALID_CARD }))).toThrow(
-      'Credit card info is invalid',
-    );
+describe('charge() — invalid card -> INVALID_ARGUMENT', () => {
+  it.each([
+    ['a Luhn-failing number', INVALID_CARD],
+    ['an empty string', ''],
+    ['all zeros', '0000000000000000'],
+  ])('rejects %s as invalid_card', async (_name, cardNumber) => {
+    const err = await failure(makeRequest({ cardNumber }));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_card');
+    expect(err.message).toBe('invalid_card: Credit card info is invalid');
   });
 
-  it('throws for an empty string', () => {
-    expect(() => charge(makeRequest({ cardNumber: '' }))).toThrow();
+  it('rejects a missing credit_card as invalid_card', async () => {
+    const err = await failure({ amount: null, credit_card: null });
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('invalid_card');
   });
 
-  it('throws InvalidCreditCard for a number that is all zeros', () => {
-    expect(() => charge(makeRequest({ cardNumber: '0000000000000000' }))).toThrow(
-      'Credit card info is invalid',
-    );
+  it('rejects AMEX as card_not_accepted, naming the brand and the accepted ones', async () => {
+    const err = await failure(makeRequest({ cardNumber: VALID_AMEX }));
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.message).toMatch(/^card_not_accepted: Sorry, we cannot process/);
+    expect(err.message).toMatch(/american.express|amex/i);
+    expect(err.message).toMatch(/VISA|MasterCard/i);
   });
 });
 
-// ---------------------------------------------------------------------------
-// Unaccepted card type
-// ---------------------------------------------------------------------------
-
-describe('charge() — unaccepted card type', () => {
-  it('throws UnacceptedCreditCard for an AMEX card', () => {
-    expect(() => charge(makeRequest({ cardNumber: VALID_AMEX }))).toThrow(
-      'Sorry, we cannot process',
+describe('charge() — expired card -> INVALID_ARGUMENT', () => {
+  it('rejects a card expired last year', async () => {
+    const err = await failure(
+      makeRequest({ expirationYear: pastYear, expirationMonth: pastMonth }),
     );
+    expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+    expect(err.reason).toBe('expired_card');
+    expect(err.message).toMatch(/^expired_card: .*expired/);
   });
 
-  it('error message names the rejected card type', () => {
-    try {
-      charge(makeRequest({ cardNumber: VALID_AMEX }));
-      fail('expected to throw');
-    } catch (err: any) {
-      expect(err.message).toMatch(/american.express|amex/i);
-    }
-  });
-
-  it('error message mentions VISA or MasterCard as accepted types', () => {
-    try {
-      charge(makeRequest({ cardNumber: VALID_AMEX }));
-    } catch (err: any) {
-      expect(err.message).toMatch(/VISA|MasterCard/i);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Expired card
-// ---------------------------------------------------------------------------
-
-describe('charge() — expired card', () => {
-  it('throws ExpiredCreditCard for a card expired last year', () => {
-    expect(() =>
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: pastYear,
-          expirationMonth: pastMonth,
-        }),
-      ),
-    ).toThrow('expired');
-  });
-
-  it('throws ExpiredCreditCard for a card that expired last month', () => {
+  it('rejects a card that expired last month', async () => {
     const lastMonth = currentMonth === 1 ? 12 : currentMonth - 1;
     const yearOfLastMonth = currentMonth === 1 ? currentYear - 1 : currentYear;
-    expect(() =>
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: yearOfLastMonth,
-          expirationMonth: lastMonth,
-        }),
-      ),
-    ).toThrow('expired');
+    const err = await failure(
+      makeRequest({ expirationYear: yearOfLastMonth, expirationMonth: lastMonth }),
+    );
+    expect(err.reason).toBe('expired_card');
   });
 
-  it('error message includes the last four digits of the card', () => {
-    try {
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: pastYear,
-          expirationMonth: pastMonth,
-        }),
-      );
-    } catch (err: any) {
-      expect(err.message).toContain('1111'); // last 4 of VALID_VISA
-    }
+  it.each([[0], [13], [99], [-1], [1.5]])(
+    'rejects expiration month %s as invalid_card (not accepted as "far in the future")',
+    async (expirationMonth) => {
+      const err = await failure(makeRequest({ expirationYear: futureYear, expirationMonth }));
+      expect(err.grpcCode).toBe(status.INVALID_ARGUMENT);
+      expect(err.reason).toBe('invalid_card');
+    },
+  );
+
+  it('message has the last four digits and the expiry, never the full number', async () => {
+    const err = await failure(makeRequest({ expirationYear: pastYear, expirationMonth: 6 }));
+    expect(err.message).toContain('ending 1111');
+    expect(err.message).toContain(`6/${pastYear}`);
+    expect(err.message).not.toContain(VALID_VISA);
   });
 
-  it('error message includes the expiry month and year', () => {
-    try {
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: pastYear,
-          expirationMonth: 6,
-        }),
-      );
-    } catch (err: any) {
-      expect(err.message).toContain(String(pastYear));
-      expect(err.message).toContain('6');
-    }
-  });
-
-  it('does not throw for a card expiring next year', () => {
-    expect(() =>
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: futureYear,
-          expirationMonth: 1,
-        }),
-      ),
-    ).not.toThrow();
+  it('expiry is checked before the test-card outcomes', async () => {
+    const err = await failure(
+      makeRequest({ cardNumber: TEST_CARDS.DECLINED, expirationYear: pastYear }),
+    );
+    expect(err.reason).toBe('expired_card');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Error code
+// Test cards
 // ---------------------------------------------------------------------------
 
-describe('charge() — error code', () => {
-  it('sets code 400 on InvalidCreditCard', () => {
+describe('charge() — test cards', () => {
+  it('4000000000000002 is declined -> FAILED_PRECONDITION card_declined', async () => {
+    const err = await failure(makeRequest({ cardNumber: TEST_CARDS.DECLINED }));
+    expect(err.grpcCode).toBe(status.FAILED_PRECONDITION);
+    expect(err.message).toMatch(/^card_declined: /);
+    expect(err.message).toContain('ending 0002');
+  });
+
+  it('4000000000009995 -> FAILED_PRECONDITION insufficient_funds', async () => {
+    const err = await failure(makeRequest({ cardNumber: TEST_CARDS.INSUFFICIENT_FUNDS }));
+    expect(err.grpcCode).toBe(status.FAILED_PRECONDITION);
+    expect(err.message).toMatch(/^insufficient_funds: /);
+    expect(err.message).toContain('ending 9995');
+  });
+
+  it('4000000000000119 waits ~3 s, then fails as retriable UNAVAILABLE processing_error', async () => {
+    sleeps.length = 0;
+    const err = await failure(makeRequest({ cardNumber: TEST_CARDS.PROCESSING_ERROR }));
+    expect(sleeps).toEqual([PROCESSING_ERROR_DELAY_MS]);
+    expect(PROCESSING_ERROR_DELAY_MS).toBe(3000);
+    expect(err.grpcCode).toBe(status.UNAVAILABLE);
+    expect(err.message).toMatch(/^processing_error: .*retry/);
+  });
+
+  it('the processing error really waits when no sleep is injected', async () => {
+    jest.useFakeTimers();
     try {
-      charge(makeRequest({ cardNumber: INVALID_CARD }));
-    } catch (err: any) {
-      expect(err.code).toBe(400);
+      let settled = false;
+      const p = charge(makeRequest({ cardNumber: TEST_CARDS.PROCESSING_ERROR }), {
+        logger: silent,
+      }).catch((e) => {
+        settled = true;
+        return e;
+      });
+      await jest.advanceTimersByTimeAsync(PROCESSING_ERROR_DELAY_MS - 1);
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      const err = await p;
+      expect(settled).toBe(true);
+      expect(err.reason).toBe('processing_error');
+    } finally {
+      jest.useRealTimers();
     }
   });
 
-  it('sets code 400 on UnacceptedCreditCard', () => {
-    try {
-      charge(makeRequest({ cardNumber: VALID_AMEX }));
-    } catch (err: any) {
-      expect(err.code).toBe(400);
-    }
+  it('test cards with separators behave the same', async () => {
+    const err = await failure(makeRequest({ cardNumber: '4000 0000 0000 0002' }));
+    expect(err.reason).toBe('card_declined');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error mapping and masking
+// ---------------------------------------------------------------------------
+
+describe('toGrpcError()', () => {
+  it('keeps code and message of a PaymentError', async () => {
+    const err = await failure(makeRequest({ cardNumber: TEST_CARDS.INSUFFICIENT_FUNDS }));
+    expect(toGrpcError(err)).toEqual({ code: status.FAILED_PRECONDITION, message: err.message });
   });
 
-  it('sets code 400 on ExpiredCreditCard', () => {
-    try {
-      charge(
-        makeRequest({
-          cardNumber: VALID_VISA,
-          expirationYear: pastYear,
-          expirationMonth: pastMonth,
-        }),
-      );
-    } catch (err: any) {
-      expect(err.code).toBe(400);
-    }
+  it('maps anything unexpected to INTERNAL with a generic message', () => {
+    const mapped = toGrpcError(new TypeError('secret 4111111111111111'));
+    expect(mapped.code).toBe(status.INTERNAL);
+    expect(mapped.message).toBe('internal_error: unexpected payment failure');
+    expect(toGrpcError('a string').code).toBe(status.INTERNAL);
+  });
+});
+
+describe('maskCard()', () => {
+  it('returns brand and last four only', () => {
+    expect(maskCard(VALID_VISA)).toEqual({ brand: 'visa', last4: '1111' });
+    expect(maskCard(VALID_MASTERCARD)).toEqual({ brand: 'mastercard', last4: '4444' });
+    expect(maskCard(undefined)).toEqual({ brand: 'unknown', last4: '' });
   });
 });

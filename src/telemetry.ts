@@ -1,6 +1,5 @@
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { resourceFromAttributes } from '@opentelemetry/resources';
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-grpc';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
@@ -10,54 +9,54 @@ import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { GrpcInstrumentation } from '@opentelemetry/instrumentation-grpc';
 import { PinoInstrumentation } from '@opentelemetry/instrumentation-pino';
 import * as api from '@opentelemetry/api';
-import { hostname } from 'os';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import Pyroscope from '@pyroscope/nodejs';
 
-const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? 'payment-service';
-const SERVICE_VERSION = process.env.SERVICE_VERSION ?? '1.0.0';
-// OTLP/gRPC endpoint (scheme required, e.g. http://alloy:4317). COLLECTOR_SERVICE_ADDR (host:port)
-// is kept as a legacy fallback.
-const OTEL_ENDPOINT =
-  process.env.OTEL_EXPORTER_OTLP_ENDPOINT ??
-  (process.env.COLLECTOR_SERVICE_ADDR
-    ? `http://${process.env.COLLECTOR_SERVICE_ADDR}`
-    : 'http://localhost:4317');
-const PYROSCOPE_ENDPOINT = process.env.PYROSCOPE_ADDR ?? 'http://localhost:4040';
-const METRIC_EXPORT_INTERVAL_MS = parseInt(process.env.OTEL_METRIC_EXPORT_INTERVAL ?? '15000', 10);
+import { pyroscopeTags, resolveTelemetryConfig, resourceAttributes } from './telemetry-config';
 
-const resource = resourceFromAttributes({
-  [ATTR_SERVICE_NAME]: SERVICE_NAME,
-  [ATTR_SERVICE_VERSION]: SERVICE_VERSION,
-  // Distinguishes replicas: in Kubernetes the hostname is the pod name.
-  'service.instance.id': process.env.HOSTNAME ?? hostname(),
-});
+// Telemetry contract: see telemetry-config.ts. With nothing set, no SDK and no
+// profiler start, so the service makes no outbound connections.
+export const telemetryConfig = resolveTelemetryConfig(process.env);
+const SERVICE_NAME = telemetryConfig.serviceName;
 
-// All three signals are pushed over OTLP/gRPC to the collector (Alloy), which fans out
-// to Tempo (traces), Mimir (metrics) and Loki (logs).
-const sdk = new NodeSDK({
-  resource,
-  spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter({ url: OTEL_ENDPOINT }))],
-  metricReaders: [
-    new PeriodicExportingMetricReader({
-      exporter: new OTLPMetricExporter({ url: OTEL_ENDPOINT }),
-      exportIntervalMillis: METRIC_EXPORT_INTERVAL_MS,
-    }),
-  ],
-  logRecordProcessors: [
-    new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: OTEL_ENDPOINT }) }),
-  ],
-  // PinoInstrumentation forwards pino records to the OTel logs pipeline and adds trace/span ids.
-  instrumentations: [new GrpcInstrumentation(), new PinoInstrumentation()],
-});
+function startSdk(endpoint: string): NodeSDK {
+  const resource = resourceFromAttributes(resourceAttributes(telemetryConfig));
 
-// Start the SDK immediately on import — server.ts does `import './telemetry'`
-// so this runs before any gRPC server/client or pino code loads, ensuring instrumentation
-// patches @grpc/grpc-js and pino before they are used.
-sdk.start();
+  // All three signals are pushed over OTLP/gRPC to the collector (Alloy), which fans out
+  // to Tempo (traces), Mimir (metrics) and Loki (logs).
+  const nodeSdk = new NodeSDK({
+    resource,
+    spanProcessors: [new BatchSpanProcessor(new OTLPTraceExporter({ url: endpoint }))],
+    metricReaders: [
+      new PeriodicExportingMetricReader({
+        exporter: new OTLPMetricExporter({ url: endpoint }),
+        exportIntervalMillis: telemetryConfig.metricExportIntervalMs,
+      }),
+    ],
+    logRecordProcessors: [
+      new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: endpoint }) }),
+    ],
+    // PinoInstrumentation forwards pino records to the OTel logs pipeline (OTLP records carry the active span).
+    // The trace_id/span_id on stdout come from the logger's own mixin (logger.ts), so the instrumentation's
+    // log correlation (extra trace_flags field, duplicate keys) is switched off.
+    instrumentations: [
+      new GrpcInstrumentation(),
+      new PinoInstrumentation({ disableLogCorrelation: true }),
+    ],
+  });
+  // Started immediately on import — server.ts imports this module first, so the
+  // instrumentation patches @grpc/grpc-js and pino before they are loaded.
+  nodeSdk.start();
+  return nodeSdk;
+}
+
+const sdk: NodeSDK | null = telemetryConfig.otlpEndpoint
+  ? startSdk(telemetryConfig.otlpEndpoint)
+  : null;
 
 // ---------------------------------------------------------------------------
 // Custom gRPC server metrics
+// (With telemetry off the global meter is the OTel no-op meter, so these cost nothing.)
 // The Node.js GrpcInstrumentation only produces traces, not metrics.
 // We create manual instruments that match the OTel RPC semantic conventions
 // so the Grafana dashboard can query them.
@@ -215,17 +214,45 @@ export function startRpcMetrics(method: string): (grpcStatusCode: number) => voi
   };
 }
 
-// --- Pyroscope continuous profiling ---
-Pyroscope.init({
-  serverAddress: PYROSCOPE_ENDPOINT,
-  appName: SERVICE_NAME,
-  tags: { version: SERVICE_VERSION },
-});
-Pyroscope.start();
+// --- Pyroscope continuous profiling (only when configured) ---
+if (telemetryConfig.pyroscopeAddr) {
+  Pyroscope.init({
+    serverAddress: telemetryConfig.pyroscopeAddr,
+    appName: SERVICE_NAME,
+    tags: pyroscopeTags(telemetryConfig),
+  });
+  Pyroscope.start();
+}
 
-process.on('SIGTERM', async () => {
-  await sdk.shutdown();
-  Pyroscope.stop();
-});
+/** Upper bound for flushing telemetry on shutdown. */
+export const SHUTDOWN_FLUSH_TIMEOUT_MS = 3000;
+let flushing: Promise<void> | null = null;
+
+/**
+ * Flushes telemetry and the profiler, bounded by SHUTDOWN_FLUSH_TIMEOUT_MS.
+ * Idempotent (a second call returns the first call's promise) and never
+ * rejects: flush failures are ignored, they must not keep the process alive.
+ * Does not exit and does not install signal handlers: the process lifecycle
+ * (drain in-flight RPCs, health, exit) lives in lifecycle.ts / server.ts.
+ */
+export function flushTelemetry(): Promise<void> {
+  flushing ??= (async () => {
+    const flush = Promise.allSettled([
+      sdk ? sdk.shutdown() : Promise.resolve(),
+      telemetryConfig.pyroscopeAddr ? Promise.resolve(Pyroscope.stop()) : Promise.resolve(),
+    ]);
+    await Promise.race([
+      flush,
+      new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS).unref()),
+    ]);
+  })();
+  return flushing;
+}
+
+/** Flushes telemetry, then exits with code 0 (used when there is no server to drain). */
+export async function shutdown(exit: (code: number) => void = process.exit): Promise<void> {
+  await flushTelemetry();
+  exit(0);
+}
 
 export { sdk };
