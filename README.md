@@ -36,7 +36,7 @@ Checks, in this order (the first failure wins):
 1. A card must be present and the number must pass `simple-card-validator` (Luhn + known brand; spaces and dashes are allowed).
 2. Brand must be **Visa or MasterCard**.
 3. CVV must be an integer 0-9999 (`credit_card_cvv` is an `int32`, so leading zeros are already lost: `012` arrives as 12, and a missing CVV arrives as 0; the check therefore rejects only values that cannot be a 3-4 digit CVV). The CVV is never logged or echoed in an error. Otherwise it is not verified.
-4. Expiry month/year must not be in the past (a card expiring this month passes).
+4. Expiry month/year must not be in the past (a card expiring this month passes). "Now" comes from an injected clock (`src/clock.ts`, default: the system clock, read in the server's local time zone; the container runs in UTC), so the month boundary is testable without waiting.
 5. `amount` must be present, `units` an integer that is not negative, `nanos` an integer 0-999999999.
 6. The documented test cards below then produce their simulated outcome; every other valid card succeeds.
 
@@ -246,6 +246,7 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 │   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
 │   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
 │   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
+│   ├── clock.ts         # Clock (now, sleep) and the system clock; injected into charge() (CODE-07)
 │   ├── refund.ts        # simulated, idempotent refund
 │   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
 │   ├── logger.ts        # pino factory: shared log shape, trace ids, card-field redaction
@@ -253,7 +254,7 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 │   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
 │   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
-├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
+├── __tests__/           # jest (fake clock in __tests__/helpers, no real sleeps against timers): charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
 ├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile
