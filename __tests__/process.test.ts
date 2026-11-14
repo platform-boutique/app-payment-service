@@ -77,13 +77,16 @@ function client(port: number) {
   );
 }
 
+// The real server process uses the system clock: a far-future expiry keeps the test independent of today.
+const FAR_FUTURE_YEAR = 2099;
+
 function chargeReq() {
   return {
     amount: { currency_code: 'USD', units: 1, nanos: 0 },
     credit_card: {
       credit_card_number: '4432-8015-6152-0454',
       credit_card_cvv: 123,
-      credit_card_expiration_year: new Date().getFullYear() + 2,
+      credit_card_expiration_year: FAR_FUTURE_YEAR,
       credit_card_expiration_month: 12,
     },
   };

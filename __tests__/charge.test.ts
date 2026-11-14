@@ -1,7 +1,9 @@
 import { status } from '@grpc/grpc-js';
 import { charge, maskCard, PROCESSING_ERROR_DELAY_MS, TEST_CARDS } from '../src/charge';
 import { PaymentError, toGrpcError } from '../src/errors';
+import { systemClock } from '../src/clock';
 import { createLogger } from '../src/logger';
+import { FakeClock } from './helpers/fake-clock';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -13,23 +15,17 @@ const VALID_MASTERCARD_2 = '5500005555555559';
 const VALID_AMEX = '371449635398431';
 const INVALID_CARD = '1234567890123456';
 
-const futureYear = new Date().getFullYear() + 1;
-const currentYear = new Date().getFullYear();
-const currentMonth = new Date().getMonth() + 1;
-
-// A month guaranteed to be in the past
+// The tests run at a fixed "now" (CODE-07): 2026-11-14, local time. Nothing here reads the real clock.
+const currentYear: number = 2026;
+const currentMonth: number = 11;
+const futureYear = currentYear + 1;
 const pastYear = currentYear - 1;
 const pastMonth = 1;
 
-// Silent logger and an instant sleep that records what it was asked to wait.
+// Silent logger and a fake clock: its sleep records what it was asked to wait and returns at once.
 const silent = createLogger('test', { write: () => undefined });
-const sleeps: number[] = [];
-const deps = {
-  logger: silent,
-  sleep: async (ms: number) => {
-    sleeps.push(ms);
-  },
-};
+const clock = new FakeClock(new Date(currentYear, currentMonth - 1, 14, 12, 0, 0));
+const deps = { logger: silent, clock };
 
 function makeRequest(overrides: {
   cardNumber?: string;
@@ -263,6 +259,100 @@ describe('charge() — expired card -> INVALID_ARGUMENT', () => {
   });
 });
 
+describe('charge() — expiry follows the injected clock', () => {
+  /** Charges a card expiring `expYear`/`expMonth` while the clock shows `now`; returns the failure reason or 'ok'. */
+  async function outcomeAt(now: Date, expYear: number, expMonth: number): Promise<string> {
+    const fake = new FakeClock(now);
+    try {
+      await charge(makeRequest({ expirationYear: expYear, expirationMonth: expMonth }), {
+        logger: silent,
+        clock: fake,
+      });
+      return 'ok';
+    } catch (err) {
+      return (err as PaymentError).reason;
+    }
+  }
+
+  it('a card is valid through the last millisecond of its expiry month', async () => {
+    expect(await outcomeAt(new Date(2026, 10, 30, 23, 59, 59, 999), 2026, 11)).toBe('ok');
+  });
+
+  it('the same card is expired from the first millisecond of the next month', async () => {
+    expect(await outcomeAt(new Date(2026, 11, 1, 0, 0, 0, 0), 2026, 11)).toBe('expired_card');
+  });
+
+  it('crosses the year boundary: 12/2026 is valid on 2026-12-31 and expired on 2027-01-01', async () => {
+    expect(await outcomeAt(new Date(2026, 11, 31, 23, 59, 59, 999), 2026, 12)).toBe('ok');
+    expect(await outcomeAt(new Date(2027, 0, 1, 0, 0, 0, 0), 2026, 12)).toBe('expired_card');
+  });
+
+  it('January: a card expiring 12 of the previous year is expired, 1 of this year is valid', async () => {
+    const jan15 = new Date(2027, 0, 15, 9, 0, 0);
+    expect(await outcomeAt(jan15, 2026, 12)).toBe('expired_card');
+    expect(await outcomeAt(jan15, 2027, 1)).toBe('ok');
+  });
+
+  it('moving the clock forward flips the result of the same request', async () => {
+    const fake = new FakeClock(new Date(2026, 5, 10));
+    const req = makeRequest({ expirationYear: 2026, expirationMonth: 6 });
+    await expect(charge(req, { logger: silent, clock: fake })).resolves.toHaveProperty(
+      'transaction_id',
+    );
+    fake.set(new Date(2026, 6, 1));
+    await expect(charge(req, { logger: silent, clock: fake })).rejects.toMatchObject({
+      reason: 'expired_card',
+    });
+  });
+
+  it('reads the clock on every call, not once at load time', async () => {
+    const now = jest.fn(() => new Date(2026, 10, 14));
+    const counting = { now, sleep: async () => undefined };
+    await charge(makeRequest({}), { logger: silent, clock: counting });
+    await charge(makeRequest({}), { logger: silent, clock: counting });
+    expect(now).toHaveBeenCalledTimes(2);
+  });
+
+  it('the expired-card message shows the card expiry, not the clock', async () => {
+    const fake = new FakeClock(new Date(2030, 0, 1));
+    const err = await charge(makeRequest({ expirationYear: 2029, expirationMonth: 3 }), {
+      logger: silent,
+      clock: fake,
+    }).catch((e) => e as PaymentError);
+    expect(err).toMatchObject({ reason: 'expired_card' });
+    expect((err as PaymentError).message).toContain('3/2029');
+  });
+
+  it('the processing-error wait goes through the clock and moves fake time, not real time', async () => {
+    const fake = new FakeClock(new Date(2026, 10, 14, 12, 0, 0));
+    const before = fake.now().getTime();
+    const started = performance.now();
+    await charge(makeRequest({ cardNumber: TEST_CARDS.PROCESSING_ERROR }), {
+      logger: silent,
+      clock: fake,
+    }).catch(() => undefined);
+    expect(fake.now().getTime() - before).toBe(PROCESSING_ERROR_DELAY_MS);
+    expect(performance.now() - started).toBeLessThan(PROCESSING_ERROR_DELAY_MS); // monotonic, not wall clock
+  });
+
+  it('the system clock is a real Date and a real timer', async () => {
+    jest.useFakeTimers();
+    try {
+      jest.setSystemTime(new Date(2026, 10, 14, 12, 0, 0));
+      expect(systemClock.now().getFullYear()).toBe(2026);
+      let done = false;
+      const p = systemClock.sleep(50).then(() => (done = true));
+      await jest.advanceTimersByTimeAsync(49);
+      expect(done).toBe(false);
+      await jest.advanceTimersByTimeAsync(1);
+      await p;
+      expect(done).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Test cards
 // ---------------------------------------------------------------------------
@@ -283,15 +373,15 @@ describe('charge() — test cards', () => {
   });
 
   it('4000000000000119 waits ~3 s, then fails as retriable UNAVAILABLE processing_error', async () => {
-    sleeps.length = 0;
+    clock.sleeps.length = 0;
     const err = await failure(makeRequest({ cardNumber: TEST_CARDS.PROCESSING_ERROR }));
-    expect(sleeps).toEqual([PROCESSING_ERROR_DELAY_MS]);
+    expect(clock.sleeps).toEqual([PROCESSING_ERROR_DELAY_MS]);
     expect(PROCESSING_ERROR_DELAY_MS).toBe(3000);
     expect(err.grpcCode).toBe(status.UNAVAILABLE);
     expect(err.message).toMatch(/^processing_error: .*retry/);
   });
 
-  it('the processing error really waits when no sleep is injected', async () => {
+  it('the processing error really waits when no clock is injected (system clock, jest fake timers)', async () => {
     jest.useFakeTimers();
     try {
       let settled = false;

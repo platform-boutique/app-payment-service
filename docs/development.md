@@ -46,6 +46,7 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 │   ├── lifecycle.ts     # health state, graceful shutdown (drain, NOT_SERVING, flush, exit)
 │   ├── handlers.ts      # Charge + Refund gRPC handlers, safe logging, status mapping
 │   ├── charge.ts        # card validation, test-card outcomes, fake charge, card masking
+│   ├── clock.ts         # Clock (now, sleep) and the system clock; injected into charge() (CODE-07)
 │   ├── refund.ts        # simulated, idempotent refund
 │   ├── errors.ts        # PaymentError classes, reason prefixes, toGrpcError
 │   ├── logger.ts        # pino factory: shared log shape, trace ids, card-field redaction
@@ -53,7 +54,7 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 │   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
 │   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
 │   └── types/simple-card-validator.d.ts
-├── __tests__/           # jest: charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
+├── __tests__/           # jest (fake clock in __tests__/helpers, no real sleeps against timers): charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
 ├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile

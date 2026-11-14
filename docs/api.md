@@ -16,7 +16,7 @@ Checks, in this order (the first failure wins):
 1. A card must be present and the number must pass `simple-card-validator` (Luhn + known brand; spaces and dashes are allowed).
 2. Brand must be **Visa or MasterCard**.
 3. CVV must be an integer 0-9999 (`credit_card_cvv` is an `int32`, so leading zeros are already lost: `012` arrives as 12, and a missing CVV arrives as 0; the check therefore rejects only values that cannot be a 3-4 digit CVV). The CVV is never logged or echoed in an error. Otherwise it is not verified.
-4. Expiry month/year must not be in the past (a card expiring this month passes).
+4. Expiry month/year must not be in the past (a card expiring this month passes). "Now" comes from an injected clock (`src/clock.ts`, default: the system clock, read in the server's local time zone; the container runs in UTC), so the month boundary is testable without waiting.
 5. `amount` must be present, `units` an integer that is not negative, `nanos` an integer 0-999999999.
 6. The documented test cards below then produce their simulated outcome; every other valid card succeeds.
 
