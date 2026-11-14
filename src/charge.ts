@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import cardValidator from 'simple-card-validator';
+import { systemClock, type Clock } from './clock';
 import { createLogger, type Logger } from './logger';
 import { assertValidMoney, type Money } from './money';
 import {
@@ -46,8 +47,8 @@ export interface ChargeResponse {
 
 export interface ChargeDeps {
   logger?: Logger;
-  /** Waits before the simulated processing error; injectable for tests. */
-  sleep?: (ms: number) => Promise<void>;
+  /** Source of "now" (card expiry) and of the wait before the simulated processing error (CODE-07). */
+  clock?: Clock;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +65,6 @@ export const TEST_CARDS = {
 export const PROCESSING_ERROR_DELAY_MS = 3000;
 
 const defaultLogger = createLogger('payment-service-charge');
-const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // Card data masking: the only card data that may be logged or returned
@@ -113,7 +113,7 @@ export async function charge(
   deps: ChargeDeps = {},
 ): Promise<ChargeResponse> {
   const logger = deps.logger ?? defaultLogger;
-  const sleep = deps.sleep ?? defaultSleep;
+  const clock = deps.clock ?? systemClock;
   const { amount, credit_card: creditCard } = request;
 
   if (!creditCard || typeof creditCard.credit_card_number !== 'string') {
@@ -141,7 +141,7 @@ export async function charge(
   const last4 = lastFour(cardNumber);
 
   // Validate expiration is >= this month
-  const now = new Date();
+  const now = clock.now();
   const currentMonth = now.getMonth() + 1;
   const currentYear = now.getFullYear();
   const { credit_card_expiration_year: year, credit_card_expiration_month: month } = creditCard;
@@ -168,7 +168,7 @@ export async function charge(
     case TEST_CARDS.INSUFFICIENT_FUNDS:
       throw new InsufficientFunds(last4);
     case TEST_CARDS.PROCESSING_ERROR:
-      await sleep(PROCESSING_ERROR_DELAY_MS);
+      await clock.sleep(PROCESSING_ERROR_DELAY_MS);
       throw new ProcessingError();
   }
 

@@ -1,5 +1,6 @@
 import { pino, type Logger, type DestinationStream } from 'pino';
 import { isSpanContextValid, trace } from '@opentelemetry/api';
+import { systemClock } from './clock';
 
 /**
  * Fields that must never reach a log line. The code never logs them on
@@ -66,7 +67,7 @@ export function createLogger(
   destination?: DestinationStream,
   opts: LoggerOptions = {},
 ): Logger {
-  const now = opts.now ?? (() => new Date());
+  const now = opts.now ?? (() => systemClock.now());
   const options = {
     level: opts.level ?? levelFromEnv(),
     messageKey: 'message',
