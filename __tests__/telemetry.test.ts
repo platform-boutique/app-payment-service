@@ -1,87 +1,90 @@
-import { resolveTelemetryConfig } from '../src/telemetry-config';
+import { pyroscopeTags, resolveTelemetryConfig, resourceAttributes } from '../src/telemetry-config';
 
 // ---------------------------------------------------------------------------
 // Contract (pure)
 // ---------------------------------------------------------------------------
 
-describe('resolveTelemetryConfig()', () => {
-  it('everything unset -> telemetry and profiling off', () => {
-    const c = resolveTelemetryConfig({});
-    expect(c.otlpEndpoint).toBeNull();
-    expect(c.pyroscopeAddr).toBeNull();
-    expect(c.telemetryReason).toMatch(/^off/);
-    expect(c.profilingReason).toMatch(/^off/);
-    expect(c.serviceName).toBe('payment-service');
-    expect(c.metricExportIntervalMs).toBe(15000);
-  });
+const EP = 'http://alloy:4317';
+const PY = 'http://pyroscope:4040';
 
-  it('empty values count as unset', () => {
-    const c = resolveTelemetryConfig({
-      OTEL_EXPORTER_OTLP_ENDPOINT: '',
-      COLLECTOR_SERVICE_ADDR: ' ',
-      PYROSCOPE_ADDR: '',
-    });
-    expect(c.otlpEndpoint).toBeNull();
-    expect(c.pyroscopeAddr).toBeNull();
-  });
-
-  it('OTEL_EXPORTER_OTLP_ENDPOINT turns telemetry on', () => {
-    const c = resolveTelemetryConfig({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://alloy:4317' });
-    expect(c.otlpEndpoint).toBe('http://alloy:4317');
-  });
-
-  it('legacy COLLECTOR_SERVICE_ADDR (host:port) turns it on, the new variable wins', () => {
-    expect(resolveTelemetryConfig({ COLLECTOR_SERVICE_ADDR: 'alloy:4317' }).otlpEndpoint).toBe(
-      'http://alloy:4317',
-    );
-    expect(
-      resolveTelemetryConfig({
-        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://a:4317',
-        COLLECTOR_SERVICE_ADDR: 'b:4317',
-      }).otlpEndpoint,
-    ).toBe('http://a:4317');
+describe('resolveTelemetryConfig() env matrix', () => {
+  it.each([
+    [{}, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: '' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: '   ' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP }, EP],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: ` ${EP} ` }, EP],
+    [
+      { OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otel.example.com:4317' },
+      'https://otel.example.com:4317',
+    ],
+    // malformed: off, never a crash
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'alloy:4317' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'alloy' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'ftp://alloy:4317' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://alloy:99999' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: 'not a url' }, null],
+    // OTEL_SDK_DISABLED=true (trimmed, any case) forces off
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, OTEL_SDK_DISABLED: 'true' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, OTEL_SDK_DISABLED: 'TRUE' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, OTEL_SDK_DISABLED: ' True ' }, null],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, OTEL_SDK_DISABLED: 'false' }, EP],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, OTEL_SDK_DISABLED: '' }, EP],
+    // the legacy switches are gone
+    [{ COLLECTOR_SERVICE_ADDR: 'alloy:4317' }, null],
+    [{ COLLECTOR_SERVICE_ADDR: 'b:4317', OTEL_EXPORTER_OTLP_ENDPOINT: EP }, EP],
+    [{ OTEL_EXPORTER_OTLP_ENDPOINT: EP, ENABLE_TRACING: '0' }, EP],
+  ])('%j -> otlpEndpoint %j', (env, expected) => {
+    expect(resolveTelemetryConfig(env).otlpEndpoint).toBe(expected);
   });
 
   it.each([
-    [{ OTEL_SDK_DISABLED: 'true' }, /OTEL_SDK_DISABLED/],
-    [{ OTEL_SDK_DISABLED: 'TRUE' }, /OTEL_SDK_DISABLED/],
-    [{ ENABLE_TRACING: '0' }, /ENABLE_TRACING/],
-  ])('%j forces telemetry off even with an endpoint', (extra, reason) => {
-    const c = resolveTelemetryConfig({
-      OTEL_EXPORTER_OTLP_ENDPOINT: 'http://alloy:4317',
-      ...extra,
-    });
-    expect(c.otlpEndpoint).toBeNull();
-    expect(c.telemetryReason).toMatch(reason);
+    [{}, null],
+    [{ PYROSCOPE_ADDR: '' }, null],
+    [{ PYROSCOPE_ADDR: PY }, PY],
+    [{ PYROSCOPE_ADDR: PY, ENABLE_PROFILING: '1' }, PY],
+    [{ ENABLE_PROFILING: '1' }, null], // no default address
+    [{ PYROSCOPE_ADDR: PY, ENABLE_PROFILING: '0' }, null],
+    [{ PYROSCOPE_ADDR: 'pyroscope:4040' }, null],
+    [{ PYROSCOPE_ADDR: 'http://' }, null],
+    [{ PYROSCOPE_ADDR: PY, OTEL_SDK_DISABLED: 'true' }, null], // forces everything off
+    [{ PYROSCOPE_ADDR: PY, OTEL_SDK_DISABLED: 'false' }, PY],
+  ])('%j -> pyroscopeAddr %j', (env, expected) => {
+    expect(resolveTelemetryConfig(env).pyroscopeAddr).toBe(expected);
   });
 
-  it('OTEL_SDK_DISABLED=false and ENABLE_TRACING=1 keep it on', () => {
-    const c = resolveTelemetryConfig({
-      OTEL_EXPORTER_OTLP_ENDPOINT: 'http://alloy:4317',
-      OTEL_SDK_DISABLED: 'false',
-      ENABLE_TRACING: '1',
-    });
-    expect(c.otlpEndpoint).toBe('http://alloy:4317');
+  it('defaults', () => {
+    const c = resolveTelemetryConfig({ HOSTNAME: 'pod-1' });
+    expect(c.serviceName).toBe('payment-service');
+    expect(c.serviceVersion).toBe('dev');
+    expect(c.serviceCommit).toBe('unknown');
+    expect(c.metricExportIntervalMs).toBe(15000);
+    expect(c.telemetryReason).toMatch(/^off/);
+    expect(c.profilingReason).toMatch(/^off/);
   });
 
-  it('profiling: on with PYROSCOPE_ADDR, off with ENABLE_PROFILING=0', () => {
-    expect(resolveTelemetryConfig({ PYROSCOPE_ADDR: 'http://alloy:4040' }).pyroscopeAddr).toBe(
-      'http://alloy:4040',
-    );
-    const off = resolveTelemetryConfig({
-      PYROSCOPE_ADDR: 'http://alloy:4040',
-      ENABLE_PROFILING: '0',
+  it('resource attributes and Pyroscope tags', () => {
+    const c = resolveTelemetryConfig({ HOSTNAME: 'pod-1' });
+    expect(resourceAttributes(c)).toEqual({
+      'service.name': 'payment-service',
+      'service.version': 'dev',
+      'service.namespace': 'everly',
+      'deployment.environment': 'local',
+      'service.instance.id': 'pod-1',
     });
-    expect(off.pyroscopeAddr).toBeNull();
-    expect(off.profilingReason).toMatch(/ENABLE_PROFILING/);
-  });
-
-  it('profiling is independent of the OTLP switches', () => {
-    const c = resolveTelemetryConfig({
-      PYROSCOPE_ADDR: 'http://p:4040',
-      OTEL_SDK_DISABLED: 'true',
+    const d = resolveTelemetryConfig({
+      SERVICE_VERSION: '1.2.3',
+      DEPLOYMENT_ENVIRONMENT: 'dev',
+      HOSTNAME: 'pod-2',
     });
-    expect(c.pyroscopeAddr).toBe('http://p:4040');
+    expect(resourceAttributes(d)['service.version']).toBe('1.2.3');
+    expect(resourceAttributes(d)['deployment.environment']).toBe('dev');
+    expect(pyroscopeTags(d)).toEqual({
+      service_name: 'payment-service',
+      version: '1.2.3',
+      environment: 'dev',
+    });
   });
 });
 
@@ -96,6 +99,8 @@ const TELEMETRY_VARS = [
   'ENABLE_TRACING',
   'PYROSCOPE_ADDR',
   'ENABLE_PROFILING',
+  'DEPLOYMENT_ENVIRONMENT',
+  'SERVICE_VERSION',
 ];
 
 function loadTelemetry(env: Record<string, string>) {

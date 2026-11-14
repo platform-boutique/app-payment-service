@@ -1,6 +1,5 @@
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import { resourceFromAttributes } from '@opentelemetry/resources';
-import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-grpc';
 import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-grpc';
@@ -10,25 +9,18 @@ import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { GrpcInstrumentation } from '@opentelemetry/instrumentation-grpc';
 import { PinoInstrumentation } from '@opentelemetry/instrumentation-pino';
 import * as api from '@opentelemetry/api';
-import { hostname } from 'os';
 import { monitorEventLoopDelay } from 'perf_hooks';
 import Pyroscope from '@pyroscope/nodejs';
 
-import { resolveTelemetryConfig } from './telemetry-config';
+import { pyroscopeTags, resolveTelemetryConfig, resourceAttributes } from './telemetry-config';
 
 // Telemetry contract: see telemetry-config.ts. With nothing set, no SDK and no
 // profiler start, so the service makes no outbound connections.
 export const telemetryConfig = resolveTelemetryConfig(process.env);
 const SERVICE_NAME = telemetryConfig.serviceName;
-const SERVICE_VERSION = telemetryConfig.serviceVersion;
 
 function startSdk(endpoint: string): NodeSDK {
-  const resource = resourceFromAttributes({
-    [ATTR_SERVICE_NAME]: SERVICE_NAME,
-    [ATTR_SERVICE_VERSION]: SERVICE_VERSION,
-    // Distinguishes replicas: in Kubernetes the hostname is the pod name.
-    'service.instance.id': process.env.HOSTNAME ?? hostname(),
-  });
+  const resource = resourceFromAttributes(resourceAttributes(telemetryConfig));
 
   // All three signals are pushed over OTLP/gRPC to the collector (Alloy), which fans out
   // to Tempo (traces), Mimir (metrics) and Loki (logs).
@@ -44,8 +36,13 @@ function startSdk(endpoint: string): NodeSDK {
     logRecordProcessors: [
       new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: endpoint }) }),
     ],
-    // PinoInstrumentation forwards pino records to the OTel logs pipeline and adds trace/span ids.
-    instrumentations: [new GrpcInstrumentation(), new PinoInstrumentation()],
+    // PinoInstrumentation forwards pino records to the OTel logs pipeline (OTLP records carry the active span).
+    // The trace_id/span_id on stdout come from the logger's own mixin (logger.ts), so the instrumentation's
+    // log correlation (extra trace_flags field, duplicate keys) is switched off.
+    instrumentations: [
+      new GrpcInstrumentation(),
+      new PinoInstrumentation({ disableLogCorrelation: true }),
+    ],
   });
   // Started immediately on import — server.ts imports this module first, so the
   // instrumentation patches @grpc/grpc-js and pino before they are loaded.
@@ -222,7 +219,7 @@ if (telemetryConfig.pyroscopeAddr) {
   Pyroscope.init({
     serverAddress: telemetryConfig.pyroscopeAddr,
     appName: SERVICE_NAME,
-    tags: { version: SERVICE_VERSION },
+    tags: pyroscopeTags(telemetryConfig),
   });
   Pyroscope.start();
 }
