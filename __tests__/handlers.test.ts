@@ -9,9 +9,11 @@ import * as protoLoader from '@grpc/proto-loader';
 import { makeHandlers } from '../src/handlers';
 import { createLogger } from '../src/logger';
 import { TEST_CARDS } from '../src/charge';
+import { FakeClock } from './helpers/fake-clock';
 
 const CVV = 987; // distinctive, so a leak is unambiguous in the logs
-const futureYear = new Date().getFullYear() + 2;
+const clock = new FakeClock(); // fixed 2026-11-14
+const futureYear = 2028;
 
 const lines: string[] = [];
 const logger = createLogger('test', {
@@ -41,7 +43,7 @@ beforeAll(async () => {
   server = new grpc.Server();
   server.addService(
     proto.PaymentService.service,
-    makeHandlers({ logger, startRpcMetrics, chargeDeps: { sleep: async () => undefined } }),
+    makeHandlers({ logger, startRpcMetrics, chargeDeps: { clock } }),
   );
   const port = await new Promise<number>((resolve, reject) =>
     server.bindAsync('127.0.0.1:0', grpc.ServerCredentials.createInsecure(), (err, p) =>

@@ -9,6 +9,7 @@ import * as protoLoader from '@grpc/proto-loader';
 import { makeHandlers } from '../src/handlers';
 import { createLogger } from '../src/logger';
 import { TEST_CARDS } from '../src/charge';
+import { FakeClock } from './helpers/fake-clock';
 import {
   createHealth,
   createShutdown,
@@ -17,7 +18,7 @@ import {
 } from '../src/lifecycle';
 
 const silent = createLogger('test', { write: () => undefined });
-const futureYear = new Date().getFullYear() + 2;
+const futureYear = 2028; // the fake clock below stands at 2026-11-14
 
 function loadProto(file: string) {
   const def = protoLoader.loadSync(path.join(__dirname, '../proto', file), {
@@ -57,10 +58,12 @@ async function start() {
       logger: silent,
       startRpcMetrics: () => () => undefined,
       chargeDeps: {
-        sleep: async () => {
-          started();
-          await gate;
-        },
+        clock: Object.assign(new FakeClock(), {
+          sleep: async () => {
+            started();
+            await gate;
+          },
+        }),
       },
     }),
   );
@@ -138,9 +141,9 @@ describe('graceful shutdown', () => {
       client.charge(slowChargeReq(), (err: grpc.ServiceError | null) => resolve(err)),
     );
     await inFlight;
-    const started = Date.now();
+    const startedAt = performance.now(); // monotonic: the wall clock of this host jumps
     await shutdown();
-    expect(Date.now() - started).toBeGreaterThanOrEqual(190);
+    expect(performance.now() - startedAt).toBeGreaterThanOrEqual(190);
     expect(forceSpy).toHaveBeenCalledTimes(1);
     expect(exit).toHaveBeenCalledWith(0);
     expect((await result)?.details ?? '').not.toMatch(/^processing_error/);
