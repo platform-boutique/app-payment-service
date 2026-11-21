@@ -12,10 +12,10 @@ Part of the [platform-demo](https://github.com/platform-boutique) platform — m
 | **Image** | `mladenovskistefan/payment-service` |
 | **Protocol / port** | gRPC (HTTP/2, plaintext) on `50051` |
 | **Metrics** | Pushed over OTLP/gRPC to Alloy → Mimir every 15 s (no scrape endpoint). Dashboard names: `rpc_server_duration_seconds_{bucket,count,sum}`, `rpc_server_requests_total`, `rpc_server_active_requests`, `build_info`, `payment_charges_total` |
-| **Health** | `grpc.health.v1.Health/Check` on `50051` — static `SERVING` |
+| **Health** | `grpc.health.v1.Health/Check` on `50051` — `SERVING`, `NOT_SERVING` during the shutdown drain |
 | **State** | None |
 | **Depends on** | Nothing (optional: OTLP collector, Pyroscope) |
-| **Called by** | `checkout-service` (`Charge`; `Refund` is not called yet) |
+| **Called by** | `checkout-service` (`Charge`; `Refund` when shipping fails after the charge) |
 | **gRPC reflection** | Enabled (v1 and v1alpha, `@grpc/reflection`): `grpcurl -plaintext localhost:50051 list` works without the proto files |
 
 ## API
@@ -159,7 +159,7 @@ livenessProbe:
 securityContext:
   runAsNonRoot: true
   runAsUser: 10001
-  runAsGroup: 101
+  runAsGroup: 10001
   allowPrivilegeEscalation: false
   capabilities: { drop: ["ALL"] }
   readOnlyRootFilesystem: true   # verified (no /tmp needed)
@@ -238,6 +238,24 @@ grpcurl -plaintext -proto proto/payment.proto -d '{"transaction_id": "abc"}' \
 grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Health/Check
 ```
 
+## Develop
+
+Requirements: Node.js 22 (`.nvmrc`; the table below was produced on the host's Node 24.14.0 after `npm ci --ignore-scripts`), Docker for the image, Python 3.12 for the docs check. The commands below are the ones the shared pipeline (`platform-demo-workflows`, `service-ci-node`) runs, so a failure can be reproduced without pushing. `Running locally` above has the run commands.
+
+| Step | Command | Result on 2026-11-21 |
+|---|---|---|
+| Format | `npm run format:check` | run, all matched files use Prettier code style |
+| Typecheck | `npm run typecheck` | run, passed |
+| Lint | `npm run lint` | run, 0 errors, 4 warnings (`no-explicit-any`) |
+| Build | `npm run build` | run, passed |
+| Unit tests | `npm run test:ci` | run: 179 passed in 9 suites (about 80 s), on Node 24.14.0 of the host (the repo pins Node 22 in `.nvmrc`; not run on 22) |
+| Dependency audit | `npm audit --audit-level=high --omit=dev` | run: exit 0 at `--audit-level=high`; it lists 1 moderate finding (`uuid` < 11.1.1, GHSA-w5hq-g745-h8pq, missing buffer bounds check in v3/v5/v6 when `buf` is provided; the fix is a breaking `uuid@14`), not changed here |
+| Image | `docker build -t platform-demo/payment-service:local .` | not run today |
+| Image scan | `trivy image --severity CRITICAL,HIGH --exit-code 1 platform-demo/payment-service:local` | not run today |
+| Secret scan | `pre-commit run --all-files` (`.pre-commit-config.yaml`, gitleaks) or `gitleaks git --redact` | run with the gitleaks binary of the pre-commit cache (`gitleaks git --redact`, full history, 53 commits): no leaks found |
+| Workflow lint | `actionlint` | run (actionlint 1.7.12), no findings |
+| Docs | `mkdocs build --strict` (mkdocs 1.6.1 + mkdocs-techdocs-core 1.7.1, Python 3.12 venv) and the link check `python3 -I tools/check-md-links.py .` from `platform-demo-workflows` (relative links in `README.md` and `docs/`) | run, both passed |
+
 ## Project structure
 
 ```
@@ -259,7 +277,7 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 ├── package.json / package-lock.json / tsconfig.json
 ├── Dockerfile
 ├── .dockerignore / .nvmrc / .eslintrc.cjs / .prettierrc / .trivyignore
-└── docs/                # empty placeholder
+└── docs/                # TechDocs pages (mkdocs.yml in the root), docs/adr/ = decisions
 ```
 
 ## Known limitations
@@ -267,5 +285,5 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 - Simulation only: no provider integration and no persistence. Each `Charge` yields a new transaction ID (no idempotency key); `Refund` cannot check that the transaction exists, or that the amount does not exceed it.
 - Outcomes are keyed only on the documented test card numbers; there are no amount-based or random declines.
 - The processing-error card blocks its call for ~3 s (a timer, not CPU); callers with a deadline below 3 s see `DEADLINE_EXCEEDED` instead of `UNAVAILABLE`.
-- `checkout-service` does not call `Refund` yet and maps every payment error to `INTERNAL` (with the reason inside the message).
+- `checkout-service` calls `Refund` once, with the transaction id of the charge, when shipping fails after a successful `Charge` (no retry; if it fails the order says the refund is pending), and passes payment's gRPC codes through (see its README, error codes). Checked in its `origin/main` code on 2026-11-21; not run against this service for this table.
 - On `SIGTERM` in-flight RPCs are drained for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5 s); a call that outlasts it is cancelled. The `Check` health handler answers `NOT_SERVING` during the drain, but `Watch` is not implemented.
