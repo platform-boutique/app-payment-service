@@ -17,6 +17,8 @@ A gRPC service that "processes" payments for the platform-demo e-commerce platfo
 
 Called by `checkout-service`. It has no downstream dependencies.
 
+Pages: [architecture](architecture.md), [API](api.md), [configuration](configuration.md), [observability](observability.md), [operations](operations.md), [development](development.md), [decisions](adr/0001-simulated-payments-keyed-on-test-cards.md).
+
 ```mermaid
 flowchart LR
   payment_service["<b>payment-service</b><br/>50051 (gRPC)"]:::me
@@ -32,10 +34,10 @@ flowchart LR
 | **Image** | `mladenovskistefan/payment-service` |
 | **Protocol / port** | gRPC (HTTP/2, plaintext) on `50051` |
 | **Metrics** | Pushed over OTLP/gRPC to Alloy → Mimir every 15 s (no scrape endpoint). Dashboard names: `rpc_server_duration_seconds_{bucket,count,sum}`, `rpc_server_requests_total`, `rpc_server_active_requests`, `build_info`, `payment_charges_total` |
-| **Health** | `grpc.health.v1.Health/Check` on `50051` — static `SERVING` |
+| **Health** | `grpc.health.v1.Health/Check` on `50051` — `SERVING`, `NOT_SERVING` during the shutdown drain |
 | **State** | None |
 | **Depends on** | Nothing (optional: OTLP collector, Pyroscope) |
-| **Called by** | `checkout-service` (`Charge`; `Refund` is not called yet) |
+| **Called by** | `checkout-service` (`Charge`; `Refund` when shipping fails after the charge) |
 | **gRPC reflection** | Enabled (v1 and v1alpha, `@grpc/reflection`): `grpcurl -plaintext localhost:50051 list` works without the proto files |
 
 ## Find it elsewhere

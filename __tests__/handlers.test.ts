@@ -90,9 +90,14 @@ function chargeReq(cardNumber: string) {
   };
 }
 
+// The CVV is 3 digits, so it can appear by chance in the millisecond part of a log timestamp (".987Z"): look at the log without it.
+function withoutTimestamps(text: string): string {
+  return text.replace(/"timestamp":"[^"]*"/g, '"timestamp":"-"');
+}
+
 function expectNoCardDataInLogs(cardNumber: string) {
   expect(lines.length).toBeGreaterThan(0);
-  const all = lines.join('\n');
+  const all = withoutTimestamps(lines.join('\n'));
   expect(all).not.toContain(cardNumber);
   expect(all).not.toContain(cardNumber.slice(0, 6)); // not even the BIN
   expect(all).not.toContain(String(CVV));
@@ -232,7 +237,7 @@ describe('logger redaction (defence in depth)', () => {
     lines.length = 0;
     logger.info({ request: chargeReq('4111111111111111') }, 'oops');
     expect(lines.join('')).not.toContain('4111111111111111');
-    expect(lines.join('')).not.toContain(String(CVV));
+    expect(withoutTimestamps(lines.join(''))).not.toContain(String(CVV));
     expect(lines.join('')).toContain('[REDACTED]');
   });
 });
