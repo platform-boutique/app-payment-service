@@ -11,4 +11,4 @@ Multi-stage [`Dockerfile`](https://github.com/platform-boutique/app-payment-serv
 - **User:** numeric `USER 10001:10001` (`appuser`/`appgroup`, created with these fixed ids; `id` in the container prints `uid=10001(appuser) gid=10001(appgroup)`). Build args `SERVICE_VERSION` (default `dev`) and `SERVICE_COMMIT` (default `unknown`) set the OCI labels `version`/`revision` (plus `source`, `licenses=Apache-2.0`) and the ENV of the same names.
 - **EXPOSE:** `50051` only.
 - **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It uses `process.env.PORT || 50051`, the same default as the server (fixed in 719ce3d; the probe command was run against the server, the image itself was not rebuilt). Kubernetes ignores it.
-- **Image size:** ~73 MB.
+- **Image size:** content size 72.5 MB (328 MB unpacked on disk), measured 2026-11-22.
