@@ -122,7 +122,7 @@ Multi-stage [`Dockerfile`](Dockerfile):
 - **User:** numeric `USER 10001:10001` (`appuser`/`appgroup`, created with these fixed ids; `id` in the container prints `uid=10001(appuser) gid=10001(appgroup)`). Build args `SERVICE_VERSION` (default `dev`) and `SERVICE_COMMIT` (default `unknown`) set the OCI labels `version`/`revision` (plus `source`, `licenses=Apache-2.0`) and the ENV of the same names.
 - **EXPOSE:** `50051` only.
 - **Docker `HEALTHCHECK`:** `grpc-js` client to `localhost:$PORT`. It uses `process.env.PORT || 50051`, the same default as the server (fixed in 719ce3d; the probe command was run against the server, the image itself was not rebuilt). Kubernetes ignores it.
-- **Image size:** ~73 MB.
+- **Image size:** content size 72.5 MB (328 MB unpacked on disk), measured 2026-11-22.
 
 ## Kubernetes deployment notes
 
@@ -240,21 +240,25 @@ grpcurl -plaintext -proto proto/health.proto localhost:50051 grpc.health.v1.Heal
 
 ## Develop
 
-Requirements: Node.js 22 (`.nvmrc`; the table below was produced on the host's Node 24.14.0 after `npm ci --ignore-scripts`), Docker for the image, Python 3.12 for the docs check. The commands below are the ones the shared pipeline (`platform-demo-workflows`, `service-ci-node`) runs, so a failure can be reproduced without pushing. `Running locally` above has the run commands.
+Requirements: Node.js 22 (`.nvmrc`; the table below was produced on 2026-11-22 on the host's Node 24.14.0 after `npm ci --ignore-scripts` and again in the CI image `node:22.22.2-alpine3.23`), Docker for the image, Python 3.12 for the docs check. The commands below are the ones the shared pipeline (`platform-demo-workflows`, `service-ci-node`) runs, so a failure can be reproduced without pushing. `Running locally` above has the run commands.
 
-| Step | Command | Result on 2026-11-21 |
+| Step | Command | Result on 2026-11-22 |
 |---|---|---|
-| Format | `npm run format:check` | run, all matched files use Prettier code style |
-| Typecheck | `npm run typecheck` | run, passed |
-| Lint | `npm run lint` | run, 0 errors, 4 warnings (`no-explicit-any`) |
-| Build | `npm run build` | run, passed |
-| Unit tests | `npm run test:ci` | run: 179 passed in 9 suites (about 80 s), on Node 24.14.0 of the host (the repo pins Node 22 in `.nvmrc`; not run on 22) |
-| Dependency audit | `npm audit --audit-level=high --omit=dev` | run: exit 0 at `--audit-level=high`; it lists 1 moderate finding (`uuid` < 11.1.1, GHSA-w5hq-g745-h8pq, missing buffer bounds check in v3/v5/v6 when `buf` is provided; the fix is a breaking `uuid@14`), not changed here |
-| Image | `docker build -t platform-demo/payment-service:local .` | not run today |
-| Image scan | `trivy image --severity CRITICAL,HIGH --exit-code 1 platform-demo/payment-service:local` | not run today |
-| Secret scan | `pre-commit run --all-files` (`.pre-commit-config.yaml`, gitleaks) or `gitleaks git --redact` | run with the gitleaks binary of the pre-commit cache (`gitleaks git --redact`, full history, 53 commits): no leaks found |
-| Workflow lint | `actionlint` | run (actionlint 1.7.12), no findings |
+| Format | `npm run format:check` | run on Node 24.14.0 (host) and on Node 22.22.2 (`node:22.22.2-alpine3.23` container, full `npm ci`): all matched files use Prettier code style |
+| Typecheck | `npm run typecheck` | run on both, passed |
+| Lint | `npm run lint` | run on both, 0 errors, 4 warnings (`no-explicit-any`) |
+| Build | `npm run build` | run on both, passed |
+| Unit tests | `npm run test:ci` | run on both: 179 passed in 9 suites (about 16 s); coverage 97.0 % statements, 89.7 % branches (`--coverage`) |
+| Dependency audit | `npm audit --audit-level=high --omit=dev` (CI) | run on both: found 0 vulnerabilities. The `uuid` advisory of 2026-11-21 (GHSA-w5hq-g745-h8pq) is fixed by `uuid` 11.1.1 (see `limitations.md`). The full `npm audit` (with dev dependencies) still lists 6 moderate findings, all one `minimatch` ReDoS advisory (GHSA-g3hv-75wg-m249) through the dev-only `@typescript-eslint` 7 packages: accepted exception, see `limitations.md` |
+| SAST | `semgrep scan --config p/typescript --config p/nodejs --config p/secrets --error --metrics=off` (semgrep 1.180.0, as CI) | run, 111 rules on 59 files: 0 findings |
+| Image | `docker build --platform linux/amd64 -t platform-demo/payment-service:local .` | run, passed; both `FROM` lines carry `@sha256:`; content size 72.5 MB (328 MB unpacked disk usage), user `10001:10001` |
+| Image scan | `trivy image --severity CRITICAL,HIGH --exit-code 1 platform-demo/payment-service:local` (Trivy 0.76.1) | run, exit 0 (alpine 3.23.4 and all Node packages: 0 findings) |
+| Container | `docker ps` health, whole shop `local/up.sh` + `local/smoke.sh` | run: the exec-form `HEALTHCHECK` reports `healthy`; `SMOKE PASSED` (87 PASS) three times in a row with this image in the shop (checkout charges a success card, a declined card and an insufficient-funds card each run); the service logged 31 info and 6 warning lines (the expected declines) and 0 error lines |
+| Secret scan | `pre-commit run --all-files` (`.pre-commit-config.yaml`, gitleaks) or `gitleaks git --redact` | run with the gitleaks binary of the pre-commit cache (`gitleaks git --redact`, full history, 61 commits): no leaks found |
+| Workflow lint | `actionlint` | run on 2026-11-21 (actionlint 1.7.12), no findings; not re-run for the workflows v3.8.0 pin change |
 | Docs | `mkdocs build --strict` (mkdocs 1.6.1 + mkdocs-techdocs-core 1.7.1, Python 3.12 venv) and the link check `python3 -I tools/check-md-links.py .` from `platform-demo-workflows` (relative links in `README.md` and `docs/`) | run, both passed |
+
+Not run: OTLP export against a real collector (the metrics are pushed, there is no scrape endpoint; the unit tests cover `payment_charges_total` and `build_info`), several replicas, `docker stop` timing of the final image.
 
 ## Project structure
 
@@ -271,6 +275,8 @@ Requirements: Node.js 22 (`.nvmrc`; the table below was produced on the host's N
 │   ├── fatal.ts         # uncaught exceptions / rejections as one JSON line, exit 1
 │   ├── telemetry.ts     # OTel SDK, RPC metrics, runtime gauges, Pyroscope, telemetry flush
 │   ├── telemetry-config.ts # on/off contract from the environment (pure, tested)
+│   ├── metrics.ts       # build_info gauge, payment_charges_total{outcome}
+│   ├── reflection.ts    # gRPC server reflection (v1, v1alpha)
 │   └── types/simple-card-validator.d.ts
 ├── __tests__/           # jest (fake clock in __tests__/helpers, no real sleeps against timers): charge, refund, handlers (in-process gRPC server, log capture), telemetry on/off, log shape, real server process (JSON lines, trace ids, SIGTERM)
 ├── proto/               # payment.proto, health.proto (loaded at runtime by @grpc/proto-loader; no codegen)
@@ -287,3 +293,5 @@ Requirements: Node.js 22 (`.nvmrc`; the table below was produced on the host's N
 - The processing-error card blocks its call for ~3 s (a timer, not CPU); callers with a deadline below 3 s see `DEADLINE_EXCEEDED` instead of `UNAVAILABLE`.
 - `checkout-service` calls `Refund` once, with the transaction id of the charge, when shipping fails after a successful `Charge` (no retry; if it fails the order says the refund is pending), and passes payment's gRPC codes through (see its README, error codes). Checked in its `origin/main` code on 2026-11-21; not run against this service for this table.
 - On `SIGTERM` in-flight RPCs are drained for at most `SHUTDOWN_DRAIN_TIMEOUT_MS` (default 5 s); a call that outlasts it is cancelled. The `Check` health handler answers `NOT_SERVING` during the drain, but `Watch` is not implemented.
+- Dependencies, 2026-11-22: `uuid` was raised from 9.0.1 to 11.1.1 to clear the moderate advisory GHSA-w5hq-g745-h8pq (v3/v5/v6 with a caller-supplied buffer; the service only calls `v4()` and `v5(name, namespace)`). 11.1.1 is the backport on the 11.x line that still works with `require`; the refund id of a given transaction id is unchanged.
+- Accepted exception, 2026-11-22: `npm audit` (all dependencies) reports one moderate `minimatch` advisory (GHSA-g3hv-75wg-m249, ReDoS) through the dev-only `@typescript-eslint` 7 packages; the fix is a major bump of the lint toolchain (`@typescript-eslint` 8). It is not in the image (`npm prune --omit=dev`) and CI audits with `--omit=dev`, which finds 0. Revisit only if the lint toolchain is updated for another reason.
